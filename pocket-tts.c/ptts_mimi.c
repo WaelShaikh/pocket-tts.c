@@ -160,14 +160,15 @@ static void elu_inplace(float *x, int n) {
 static void resblock_forward(const ptts_resblock *rb, float *x, int T) {
     int dim = rb->dim;
     int out_len = T;
+    int c1_out = rb->conv1.out_ch;
     float *tmp = (float *)malloc((size_t)dim * out_len * sizeof(float));
-    float *tmp2 = (float *)malloc((size_t)dim * out_len * sizeof(float));
+    float *tmp2 = (float *)malloc((size_t)c1_out * out_len * sizeof(float));
     if (!tmp || !tmp2) { free(tmp); free(tmp2); return; }
 
     memcpy(tmp, x, (size_t)dim * out_len * sizeof(float));
     elu_inplace(tmp, dim * out_len);
     conv1d_forward_stream(&rb->conv1, tmp, T, tmp2);
-    elu_inplace(tmp2, dim * out_len);
+    elu_inplace(tmp2, c1_out * out_len);
     conv1d_forward_stream(&rb->conv2, tmp2, T, tmp);
 
     ptts_add_inplace(x, tmp, dim * out_len);

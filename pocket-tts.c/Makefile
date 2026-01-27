@@ -111,6 +111,9 @@ cuda-validate-test: cuda-validate
 	grep -E "CUDA validate" /tmp/ptts-validate.log || true; \
 	awk -v th=$$TH '/CUDA validate/ { if ($$NF+0 > th) { bad=1; } } END { if (bad) { print "CUDA validate: FAIL (maxdiff > " th ")"; exit 1 } else { print "CUDA validate: PASS (maxdiff <= " th ")"; } }' /tmp/ptts-validate.log
 
+cuda-sanitize: cuda
+	@compute-sanitizer --tool memcheck ./ptts -d ./pocket-tts-model -p "Hello world. This is a test. Can you hear me okay? Great, Let's get started then." -o /tmp/ptts-sanitize.wav --voice alba
+
 # =============================================================================
 # Dependencies
 # =============================================================================
