@@ -30,13 +30,6 @@ CUDA builds require the CUDA toolkit + cuBLAS + NVRTC.
 
 <video src="https://github.com/user-attachments/assets/adcf2f2e-ffee-4b0e-a98a-f174bb06b4d9" controls></video>
 
-Or locally:
-
-```bash
-afplay sample.wav   # macOS
-aplay sample.wav    # Linux
-```
-
 ## Features
 
 - Pure C, no external runtime dependencies
