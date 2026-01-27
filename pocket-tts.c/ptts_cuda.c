@@ -9,6 +9,10 @@
 #include <string.h>
 #include "ptts_kernels.h"
 
+#define FLOWLM_FLOW_DIM 512
+#define FLOWLM_LATENT_DIM 32
+#define FLOWLM_D_MODEL 1024
+
 static void cuda_log_error(const char *where, cudaError_t err) {
     if (err == cudaSuccess) return;
     fprintf(stderr, "[ptts] CUDA error at %s: %s\n", where, cudaGetErrorString(err));
@@ -27,8 +31,12 @@ static int g_cuda_convtr_inited = 0;
 static int g_cuda_convtr_enabled = 1;
 static int g_cuda_conv1d_inited = 0;
 static int g_cuda_conv1d_enabled = 1;
+#ifdef PTTS_CUDA_VALIDATE
 static int g_cuda_validate_inited = 0;
 static int g_cuda_validate_enabled = 0;
+#endif
+static int g_flow_profile_inited = 0;
+static int g_flow_profile_enabled = 0;
 
 static int cuda_debug_enabled(void) {
     if (!g_cuda_debug_inited) {
@@ -72,6 +80,15 @@ static int cuda_validate_enabled(void) {
 }
 #endif
 
+static int flow_profile_enabled(void) {
+    if (!g_flow_profile_inited) {
+        const char *v = getenv("PTTS_FLOWNET_PROFILE");
+        g_flow_profile_enabled = (v && v[0] && strcmp(v, "0") != 0);
+        g_flow_profile_inited = 1;
+    }
+    return g_flow_profile_enabled;
+}
+
 static int cuda_check(const char *where) {
     if (!cuda_debug_enabled()) return 0;
     cudaError_t err = cudaDeviceSynchronize();
@@ -107,6 +124,17 @@ static CUfunction g_conv1d;
 static CUfunction g_convtr1d;
 static CUfunction g_elu;
 static CUfunction g_add;
+static CUfunction g_silu;
+static CUfunction g_add3;
+static CUfunction g_affine;
+static CUfunction g_gate_add;
+static CUfunction g_bias;
+static CUfunction g_layernorm;
+static CUfunction g_rmsnorm;
+static CUfunction g_attn_scores;
+static CUfunction g_attn_softmax;
+static CUfunction g_attn_apply;
+static CUfunction g_attn_fused;
 static int g_kernels_ready = 0;
 static float *g_conv_buf0 = NULL;
 static float *g_conv_buf1 = NULL;
@@ -116,6 +144,38 @@ static size_t g_conv_buf0_bytes = 0;
 static size_t g_conv_buf1_bytes = 0;
 static size_t g_conv_buf2_bytes = 0;
 static size_t g_conv_buf3_bytes = 0;
+static float *g_flow_buf0 = NULL;
+static float *g_flow_buf1 = NULL;
+static float *g_flow_buf2 = NULL;
+static float *g_flow_buf3 = NULL;
+static float *g_flow_buf4 = NULL;
+static float *g_flow_buf5 = NULL;
+static float *g_flow_buf6 = NULL;
+static float *g_flow_buf7 = NULL;
+static float *g_flow_buf8 = NULL;
+static float *g_flow_buf9 = NULL;
+static float *g_flow_buf10 = NULL;
+static size_t g_flow_buf0_bytes = 0;
+static size_t g_flow_buf1_bytes = 0;
+static size_t g_flow_buf2_bytes = 0;
+static size_t g_flow_buf3_bytes = 0;
+static size_t g_flow_buf4_bytes = 0;
+static size_t g_flow_buf5_bytes = 0;
+static size_t g_flow_buf6_bytes = 0;
+static size_t g_flow_buf7_bytes = 0;
+static size_t g_flow_buf8_bytes = 0;
+static size_t g_flow_buf9_bytes = 0;
+static size_t g_flow_buf10_bytes = 0;
+static float *g_attn_q = NULL;
+static float *g_attn_k = NULL;
+static float *g_attn_v = NULL;
+static float *g_attn_scores_buf = NULL;
+static float *g_attn_out = NULL;
+static size_t g_attn_q_bytes = 0;
+static size_t g_attn_k_bytes = 0;
+static size_t g_attn_v_bytes = 0;
+static size_t g_attn_scores_bytes = 0;
+static size_t g_attn_out_bytes = 0;
 
 static int ensure_kernels(void) {
     if (g_kernels_ready) return 0;
@@ -192,6 +252,181 @@ static int ensure_kernels(void) {
         "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
         "  if (i >= n) return;\n"
         "  a[i] += b[i];\n"
+        "}\n"
+        "extern \"C\" __global__ void bias_kernel(float* x, const float* b, int n) {\n"
+        "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  if (i >= n) return;\n"
+        "  x[i] += b[i];\n"
+        "}\n"
+        "extern \"C\" __global__ void silu_kernel(float* x, int n) {\n"
+        "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  if (i >= n) return;\n"
+        "  float v = x[i];\n"
+        "  x[i] = v / (1.0f + expf(-v));\n"
+        "}\n"
+        "extern \"C\" __global__ void add3_kernel(float* out, const float* a, const float* b, const float* c, int n, float scale) {\n"
+        "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  if (i >= n) return;\n"
+        "  out[i] = (a[i] + b[i]) * scale + c[i];\n"
+        "}\n"
+        "extern \"C\" __global__ void affine_kernel(float* x, const float* scale, const float* shift, int n) {\n"
+        "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  if (i >= n) return;\n"
+        "  x[i] = x[i] * (1.0f + scale[i]) + shift[i];\n"
+        "}\n"
+        "extern \"C\" __global__ void gate_add_kernel(float* x, const float* gate, const float* delta, int n) {\n"
+        "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  if (i >= n) return;\n"
+        "  x[i] += gate[i] * delta[i];\n"
+        "}\n"
+        "extern \"C\" __global__ void layernorm_kernel(const float* x, const float* w, const float* b, float* y, int d, float eps) {\n"
+        "  __shared__ float s_sum[256];\n"
+        "  __shared__ float s_sumsq[256];\n"
+        "  int tid = (int)threadIdx.x;\n"
+        "  float sum = 0.0f;\n"
+        "  float sumsq = 0.0f;\n"
+        "  for (int i = tid; i < d; i += blockDim.x) {\n"
+        "    float v = x[i];\n"
+        "    sum += v;\n"
+        "    sumsq += v * v;\n"
+        "  }\n"
+        "  s_sum[tid] = sum;\n"
+        "  s_sumsq[tid] = sumsq;\n"
+        "  __syncthreads();\n"
+        "  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n"
+        "    if (tid < stride) {\n"
+        "      s_sum[tid] += s_sum[tid + stride];\n"
+        "      s_sumsq[tid] += s_sumsq[tid + stride];\n"
+        "    }\n"
+        "    __syncthreads();\n"
+        "  }\n"
+        "  float mean = s_sum[0] / (float)d;\n"
+        "  float var = s_sumsq[0] / (float)d - mean * mean;\n"
+        "  float inv = rsqrtf(var + eps);\n"
+        "  for (int i = tid; i < d; i += blockDim.x) {\n"
+        "    float v = (x[i] - mean) * inv;\n"
+        "    if (w) v *= w[i];\n"
+        "    if (b) v += b[i];\n"
+        "    y[i] = v;\n"
+        "  }\n"
+        "}\n"
+        "extern \"C\" __global__ void rmsnorm_kernel(const float* x, const float* alpha, float* y, int d, float eps) {\n"
+        "  __shared__ float s_sum[256];\n"
+        "  __shared__ float s_sumsq[256];\n"
+        "  int tid = (int)threadIdx.x;\n"
+        "  float sum = 0.0f;\n"
+        "  float sumsq = 0.0f;\n"
+        "  for (int i = tid; i < d; i += blockDim.x) {\n"
+        "    float v = x[i];\n"
+        "    sum += v;\n"
+        "    sumsq += v * v;\n"
+        "  }\n"
+        "  s_sum[tid] = sum;\n"
+        "  s_sumsq[tid] = sumsq;\n"
+        "  __syncthreads();\n"
+        "  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n"
+        "    if (tid < stride) {\n"
+        "      s_sum[tid] += s_sum[tid + stride];\n"
+        "      s_sumsq[tid] += s_sumsq[tid + stride];\n"
+        "    }\n"
+        "    __syncthreads();\n"
+        "  }\n"
+        "  float mean = s_sum[0] / (float)d;\n"
+        "  float var = s_sumsq[0] - 2.0f * mean * s_sum[0] + mean * mean * (float)d;\n"
+        "  if (d > 1) var /= (float)(d - 1);\n"
+        "  else var = 0.0f;\n"
+        "  float inv = rsqrtf(var + eps);\n"
+        "  for (int i = tid; i < d; i += blockDim.x) {\n"
+        "    float v = x[i] * (alpha ? alpha[i] : 1.0f) * inv;\n"
+        "    y[i] = v;\n"
+        "  }\n"
+        "}\n"
+        "extern \"C\" __global__ void attn_scores_kernel(const float* q, const float* k, float* scores, int T, int H, int D, float scale) {\n"
+        "  int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  int total = H * T * T;\n"
+        "  if (idx >= total) return;\n"
+        "  int tk = idx % T;\n"
+        "  int tq = (idx / T) % T;\n"
+        "  int h = idx / (T * T);\n"
+        "  if (tk > tq) {\n"
+        "    scores[idx] = -1e30f;\n"
+        "    return;\n"
+        "  }\n"
+        "  const float* qv = q + ((tq * H + h) * D);\n"
+        "  const float* kv = k + ((tk * H + h) * D);\n"
+        "  float dot = 0.0f;\n"
+        "  for (int d = 0; d < D; d++) dot += qv[d] * kv[d];\n"
+        "  scores[idx] = dot * scale;\n"
+        "}\n"
+        "extern \"C\" __global__ void attn_softmax_kernel(float* scores, int T, int H) {\n"
+        "  int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  int total = H * T;\n"
+        "  if (idx >= total) return;\n"
+        "  int h = idx / T;\n"
+        "  int tq = idx - h * T;\n"
+        "  float maxv = -1e30f;\n"
+        "  for (int tk = 0; tk <= tq; tk++) {\n"
+        "    float v = scores[(h * T + tq) * T + tk];\n"
+        "    if (v > maxv) maxv = v;\n"
+        "  }\n"
+        "  float sum = 0.0f;\n"
+        "  for (int tk = 0; tk <= tq; tk++) {\n"
+        "    float v = expf(scores[(h * T + tq) * T + tk] - maxv);\n"
+        "    scores[(h * T + tq) * T + tk] = v;\n"
+        "    sum += v;\n"
+        "  }\n"
+        "  float inv = 1.0f / sum;\n"
+        "  for (int tk = 0; tk <= tq; tk++) {\n"
+        "    scores[(h * T + tq) * T + tk] *= inv;\n"
+        "  }\n"
+        "}\n"
+        "extern \"C\" __global__ void attn_apply_kernel(const float* scores, const float* v, float* out, int T, int H, int D) {\n"
+        "  int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  int total = H * T;\n"
+        "  if (idx >= total) return;\n"
+        "  int h = idx / T;\n"
+        "  int tq = idx - h * T;\n"
+        "  float* outv = out + ((tq * H + h) * D);\n"
+        "  for (int d = 0; d < D; d++) outv[d] = 0.0f;\n"
+        "  for (int tk = 0; tk <= tq; tk++) {\n"
+        "    float w = scores[(h * T + tq) * T + tk];\n"
+        "    const float* vv = v + ((tk * H + h) * D);\n"
+        "    for (int d = 0; d < D; d++) outv[d] += w * vv[d];\n"
+        "  }\n"
+        "}\n"
+        "extern \"C\" __global__ void attn_fused_kernel(const float* q, const float* k, const float* v, float* out, int T, int H, int D, float scale) {\n"
+        "  int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  int total = H * T;\n"
+        "  if (idx >= total) return;\n"
+        "  int h = idx / T;\n"
+        "  int tq = idx - h * T;\n"
+        "  const float* qv = q + ((tq * H + h) * D);\n"
+        "  float maxv = -1e30f;\n"
+        "  for (int tk = 0; tk <= tq; tk++) {\n"
+        "    const float* kv = k + ((tk * H + h) * D);\n"
+        "    float dot = 0.0f;\n"
+        "    for (int d = 0; d < D; d++) dot += qv[d] * kv[d];\n"
+        "    float s = dot * scale;\n"
+        "    if (s > maxv) maxv = s;\n"
+        "  }\n"
+        "  float sum = 0.0f;\n"
+        "  for (int tk = 0; tk <= tq; tk++) {\n"
+        "    const float* kv = k + ((tk * H + h) * D);\n"
+        "    float dot = 0.0f;\n"
+        "    for (int d = 0; d < D; d++) dot += qv[d] * kv[d];\n"
+        "    sum += expf(dot * scale - maxv);\n"
+        "  }\n"
+        "  float inv = 1.0f / sum;\n"
+        "  float* outv = out + ((tq * H + h) * D);\n"
+        "  for (int d = 0; d < D; d++) outv[d] = 0.0f;\n"
+        "  for (int tk = 0; tk <= tq; tk++) {\n"
+        "    const float* kv = k + ((tk * H + h) * D);\n"
+        "    float dot = 0.0f;\n"
+        "    for (int d = 0; d < D; d++) dot += qv[d] * kv[d];\n"
+        "    float w = expf(dot * scale - maxv) * inv;\n"
+        "    const float* vv = v + ((tk * H + h) * D);\n"
+        "    for (int d = 0; d < D; d++) outv[d] += w * vv[d];\n"
+        "  }\n"
         "}\n";
 
     nvrtcProgram prog;
@@ -238,6 +473,28 @@ static int ensure_kernels(void) {
     if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(elu)", cuerr); return -1; }
     cuerr = cuModuleGetFunction(&g_add, g_mod, "add_kernel");
     if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(add)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_bias, g_mod, "bias_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(bias)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_silu, g_mod, "silu_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(silu)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_add3, g_mod, "add3_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(add3)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_affine, g_mod, "affine_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(affine)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_gate_add, g_mod, "gate_add_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(gate_add)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_layernorm, g_mod, "layernorm_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(layernorm)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_rmsnorm, g_mod, "rmsnorm_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(rmsnorm)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_attn_scores, g_mod, "attn_scores_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(attn_scores)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_attn_softmax, g_mod, "attn_softmax_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(attn_softmax)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_attn_apply, g_mod, "attn_apply_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(attn_apply)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_attn_fused, g_mod, "attn_fused_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(attn_fused)", cuerr); return -1; }
 
     g_kernels_ready = 1;
     return 0;
@@ -494,6 +751,128 @@ static int add_device(float *a, const float *b, int n) {
         return -1;
     }
     if (cuda_check("add_device") != 0) return -1;
+    return 0;
+}
+
+static int bias_device(float *x, const float *b, int n) {
+    if (ensure_kernels() != 0) return -1;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    void *args[] = {&x, &b, &n};
+    CUresult cuerr = cuLaunchKernel(g_bias, grid, 1, 1, block, 1, 1, 0, 0, args, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(bias)", cuerr);
+        return -1;
+    }
+    if (cuda_check("bias_device") != 0) return -1;
+    return 0;
+}
+
+static int silu_device(float *x, int n) {
+    if (ensure_kernels() != 0) return -1;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    void *args[] = {&x, &n};
+    CUresult cuerr = cuLaunchKernel(g_silu, grid, 1, 1, block, 1, 1, 0, 0, args, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(silu)", cuerr);
+        return -1;
+    }
+    if (cuda_check("silu_device") != 0) return -1;
+    return 0;
+}
+
+static int add3_device(float *out, const float *a, const float *b, const float *c, int n, float scale) {
+    if (ensure_kernels() != 0) return -1;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    void *args[] = {&out, &a, &b, &c, &n, &scale};
+    CUresult cuerr = cuLaunchKernel(g_add3, grid, 1, 1, block, 1, 1, 0, 0, args, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(add3)", cuerr);
+        return -1;
+    }
+    if (cuda_check("add3_device") != 0) return -1;
+    return 0;
+}
+
+static int affine_device(float *x, const float *scale, const float *shift, int n) {
+    if (ensure_kernels() != 0) return -1;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    void *args[] = {&x, &scale, &shift, &n};
+    CUresult cuerr = cuLaunchKernel(g_affine, grid, 1, 1, block, 1, 1, 0, 0, args, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(affine)", cuerr);
+        return -1;
+    }
+    if (cuda_check("affine_device") != 0) return -1;
+    return 0;
+}
+
+static int gate_add_device(float *x, const float *gate, const float *delta, int n) {
+    if (ensure_kernels() != 0) return -1;
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    void *args[] = {&x, &gate, &delta, &n};
+    CUresult cuerr = cuLaunchKernel(g_gate_add, grid, 1, 1, block, 1, 1, 0, 0, args, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(gate_add)", cuerr);
+        return -1;
+    }
+    if (cuda_check("gate_add_device") != 0) return -1;
+    return 0;
+}
+
+static int layernorm_device(const float *x, const float *w, const float *b, float *y, int d, float eps) {
+    if (ensure_kernels() != 0) return -1;
+    int block = 256;
+    void *args[] = {&x, &w, &b, &y, &d, &eps};
+    CUresult cuerr = cuLaunchKernel(g_layernorm, 1, 1, 1, block, 1, 1, 0, 0, args, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(layernorm)", cuerr);
+        return -1;
+    }
+    if (cuda_check("layernorm_device") != 0) return -1;
+    return 0;
+}
+
+static int rmsnorm_device(const float *x, const float *alpha, float *y, int d, float eps) {
+    if (ensure_kernels() != 0) return -1;
+    int block = 256;
+    void *args[] = {&x, &alpha, &y, &d, &eps};
+    CUresult cuerr = cuLaunchKernel(g_rmsnorm, 1, 1, 1, block, 1, 1, 0, 0, args, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(rmsnorm)", cuerr);
+        return -1;
+    }
+    if (cuda_check("rmsnorm_device") != 0) return -1;
+    return 0;
+}
+
+static int linear_device(float *d_y, const float *d_x, const float *w, const float *b,
+                         int in, int out) {
+    if (ensure_init() != 0) return -1;
+    float *d_w = get_weight_device(w, (size_t)out * (size_t)in * sizeof(float));
+    if (!d_w) return -1;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasSgemm(
+        g_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        out, 1, in,
+        &alpha,
+        d_w, in,
+        d_x, in,
+        &beta,
+        d_y, out);
+    if (st != CUBLAS_STATUS_SUCCESS) return -1;
+    if (cuda_check("cublasSgemm_device") != 0) return -1;
+    if (b) {
+        float *d_b = get_weight_device(b, (size_t)out * sizeof(float));
+        if (!d_b) return -1;
+        if (bias_device(d_y, d_b, out) != 0) return -1;
+    }
     return 0;
 }
 
@@ -1083,6 +1462,172 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     return 0;
 }
 
+int ptts_cuda_flownet_forward(const ptts_cuda_flow_net_desc *desc,
+                              const float *cond, const float *ts, const float *tt,
+                              const float *x_in, float *out) {
+    if (!desc || !cond || !ts || !tt || !x_in || !out) return -1;
+    if (ensure_kernels() != 0) return -1;
+    if (ensure_init() != 0) return -1;
+
+    if (ensure_device_buffer(&g_flow_buf0, &g_flow_buf0_bytes, FLOWLM_LATENT_DIM * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf1, &g_flow_buf1_bytes, FLOWLM_FLOW_DIM * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf2, &g_flow_buf2_bytes, FLOWLM_FLOW_DIM * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf3, &g_flow_buf3_bytes, FLOWLM_FLOW_DIM * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf4, &g_flow_buf4_bytes, FLOWLM_FLOW_DIM * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf5, &g_flow_buf5_bytes, FLOWLM_FLOW_DIM * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf6, &g_flow_buf6_bytes, FLOWLM_FLOW_DIM * 3 * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf7, &g_flow_buf7_bytes, FLOWLM_FLOW_DIM * 2 * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf8, &g_flow_buf8_bytes, FLOWLM_D_MODEL * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf9, &g_flow_buf9_bytes, FLOWLM_FLOW_DIM * sizeof(float)) != 0) return -1;
+    if (ensure_device_buffer(&g_flow_buf10, &g_flow_buf10_bytes, FLOWLM_FLOW_DIM * sizeof(float)) != 0) return -1;
+
+    float *d_xin = g_flow_buf0;
+    float *d_x = g_flow_buf1;
+    float *d_tmp = g_flow_buf2;
+    float *d_tmp2 = g_flow_buf3;
+    float *d_tmp3 = g_flow_buf4;
+    float *d_mlp = g_flow_buf5;
+    float *d_ada = g_flow_buf6;
+    float *d_ada2 = g_flow_buf7;
+    float *d_cond = g_flow_buf8;
+    float *d_ts = g_flow_buf9;
+    float *d_tt = g_flow_buf10;
+
+    int profile = flow_profile_enabled();
+    cudaEvent_t ev_start, ev_stop;
+    if (profile) {
+        cudaEventCreate(&ev_start);
+        cudaEventCreate(&ev_stop);
+    }
+
+    if (cudaMemcpy(d_xin, x_in, FLOWLM_LATENT_DIM * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(d_cond, cond, FLOWLM_D_MODEL * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(d_ts, ts, FLOWLM_FLOW_DIM * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(d_tt, tt, FLOWLM_FLOW_DIM * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+
+    if (profile) cudaEventRecord(ev_start, 0);
+    if (linear_device(d_x, d_xin, desc->input_w, desc->input_b, FLOWLM_LATENT_DIM, FLOWLM_FLOW_DIM) != 0) return -1;
+    if (profile) {
+        cudaEventRecord(ev_stop, 0);
+        cudaEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        fprintf(stderr, "[ptts] FlowNet input_proj: %.3f ms\n", ms);
+    }
+
+    if (profile) cudaEventRecord(ev_start, 0);
+    if (linear_device(d_tmp, d_cond, desc->cond_w, desc->cond_b, FLOWLM_D_MODEL, FLOWLM_FLOW_DIM) != 0) return -1;
+    if (add3_device(d_tmp2, d_ts, d_tt, d_tmp, FLOWLM_FLOW_DIM, 0.5f) != 0) return -1;
+    if (profile) {
+        cudaEventRecord(ev_stop, 0);
+        cudaEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        fprintf(stderr, "[ptts] FlowNet cond+time: %.3f ms\n", ms);
+    }
+
+    for (int b = 0; b < 6; b++) {
+        const float *ln_w = desc->res[b].in_ln_w;
+        const float *ln_b = desc->res[b].in_ln_b;
+        if (profile) cudaEventRecord(ev_start, 0);
+        if (layernorm_device(d_x, ln_w ? get_weight_device(ln_w, FLOWLM_FLOW_DIM * sizeof(float)) : NULL,
+                             ln_b ? get_weight_device(ln_b, FLOWLM_FLOW_DIM * sizeof(float)) : NULL,
+                             d_tmp, FLOWLM_FLOW_DIM, 1e-6f) != 0) return -1;
+
+        if (cudaMemcpy(d_tmp3, d_tmp2, FLOWLM_FLOW_DIM * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return -1;
+        if (silu_device(d_tmp3, FLOWLM_FLOW_DIM) != 0) return -1;
+
+        if (linear_device(d_ada, d_tmp3, desc->res[b].ada_w, desc->res[b].ada_b,
+                          FLOWLM_FLOW_DIM, FLOWLM_FLOW_DIM * 3) != 0) return -1;
+        if (profile) {
+            cudaEventRecord(ev_stop, 0);
+            cudaEventSynchronize(ev_stop);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, ev_start, ev_stop);
+            fprintf(stderr, "[ptts] FlowNet res%d norm+ada: %.3f ms\n", b, ms);
+        }
+
+        const float *d_shift = d_ada;
+        const float *d_scale = d_ada + FLOWLM_FLOW_DIM;
+        const float *d_gate = d_ada + 2 * FLOWLM_FLOW_DIM;
+        if (affine_device(d_tmp, d_scale, d_shift, FLOWLM_FLOW_DIM) != 0) return -1;
+
+        if (profile) cudaEventRecord(ev_start, 0);
+        if (linear_device(d_mlp, d_tmp, desc->res[b].mlp0_w, desc->res[b].mlp0_b,
+                          FLOWLM_FLOW_DIM, FLOWLM_FLOW_DIM) != 0) return -1;
+        if (silu_device(d_mlp, FLOWLM_FLOW_DIM) != 0) return -1;
+        if (linear_device(d_tmp3, d_mlp, desc->res[b].mlp2_w, desc->res[b].mlp2_b,
+                          FLOWLM_FLOW_DIM, FLOWLM_FLOW_DIM) != 0) return -1;
+        if (gate_add_device(d_x, d_gate, d_tmp3, FLOWLM_FLOW_DIM) != 0) return -1;
+        if (profile) {
+            cudaEventRecord(ev_stop, 0);
+            cudaEventSynchronize(ev_stop);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, ev_start, ev_stop);
+            fprintf(stderr, "[ptts] FlowNet res%d mlp+gate: %.3f ms\n", b, ms);
+        }
+    }
+
+    if (profile) cudaEventRecord(ev_start, 0);
+    if (layernorm_device(d_x, NULL, NULL, d_tmp, FLOWLM_FLOW_DIM, 1e-6f) != 0) return -1;
+    if (cudaMemcpy(d_tmp3, d_tmp2, FLOWLM_FLOW_DIM * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return -1;
+    if (silu_device(d_tmp3, FLOWLM_FLOW_DIM) != 0) return -1;
+    if (linear_device(d_ada2, d_tmp3, desc->final.ada_w, desc->final.ada_b,
+                      FLOWLM_FLOW_DIM, FLOWLM_FLOW_DIM * 2) != 0) return -1;
+    const float *d_shift2 = d_ada2;
+    const float *d_scale2 = d_ada2 + FLOWLM_FLOW_DIM;
+    if (affine_device(d_tmp, d_scale2, d_shift2, FLOWLM_FLOW_DIM) != 0) return -1;
+    if (linear_device(d_xin, d_tmp, desc->final.linear_w, desc->final.linear_b,
+                      FLOWLM_FLOW_DIM, FLOWLM_LATENT_DIM) != 0) return -1;
+    if (profile) {
+        cudaEventRecord(ev_stop, 0);
+        cudaEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        fprintf(stderr, "[ptts] FlowNet final: %.3f ms\n", ms);
+    }
+
+    if (cudaMemcpy(out, d_xin, FLOWLM_LATENT_DIM * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    if (profile) {
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_stop);
+    }
+    return 0;
+}
+
+int ptts_cuda_attention_forward(const float *q, const float *k, const float *v,
+                                int T, int H, int D, float *out) {
+    if (!q || !k || !v || !out || T <= 0 || H <= 0 || D <= 0) return -1;
+    if (ensure_kernels() != 0) return -1;
+
+    size_t q_bytes = (size_t)T * H * D * sizeof(float);
+    size_t out_bytes = (size_t)T * H * D * sizeof(float);
+
+    if (ensure_device_buffer(&g_attn_q, &g_attn_q_bytes, q_bytes) != 0) return -1;
+    if (ensure_device_buffer(&g_attn_k, &g_attn_k_bytes, q_bytes) != 0) return -1;
+    if (ensure_device_buffer(&g_attn_v, &g_attn_v_bytes, q_bytes) != 0) return -1;
+    if (ensure_device_buffer(&g_attn_out, &g_attn_out_bytes, out_bytes) != 0) return -1;
+
+    if (cudaMemcpy(g_attn_q, q, q_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(g_attn_k, k, q_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(g_attn_v, v, q_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+
+    float scale = 1.0f / sqrtf((float)D);
+    int total = H * T;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    void *args_fused[] = {&g_attn_q, &g_attn_k, &g_attn_v, &g_attn_out, &T, &H, &D, &scale};
+    CUresult cuerr = cuLaunchKernel(g_attn_fused, grid, 1, 1, block, 1, 1, 0, 0, args_fused, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(attn_fused)", cuerr);
+        return -1;
+    }
+    if (cuda_check("attn_fused") != 0) return -1;
+
+    if (cudaMemcpy(out, g_attn_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    return 0;
+}
+
 void ptts_cuda_shutdown(void) {
     if (!g_inited) return;
     for (int i = 0; i < g_cache_len; i++) {
@@ -1114,6 +1659,54 @@ void ptts_cuda_shutdown(void) {
     g_conv_buf1_bytes = 0;
     g_conv_buf2_bytes = 0;
     g_conv_buf3_bytes = 0;
+    if (g_flow_buf0) cudaFree(g_flow_buf0);
+    if (g_flow_buf1) cudaFree(g_flow_buf1);
+    if (g_flow_buf2) cudaFree(g_flow_buf2);
+    if (g_flow_buf3) cudaFree(g_flow_buf3);
+    if (g_flow_buf4) cudaFree(g_flow_buf4);
+    if (g_flow_buf5) cudaFree(g_flow_buf5);
+    if (g_flow_buf6) cudaFree(g_flow_buf6);
+    if (g_flow_buf7) cudaFree(g_flow_buf7);
+    if (g_flow_buf8) cudaFree(g_flow_buf8);
+    if (g_flow_buf9) cudaFree(g_flow_buf9);
+    if (g_flow_buf10) cudaFree(g_flow_buf10);
+    g_flow_buf0 = NULL;
+    g_flow_buf1 = NULL;
+    g_flow_buf2 = NULL;
+    g_flow_buf3 = NULL;
+    g_flow_buf4 = NULL;
+    g_flow_buf5 = NULL;
+    g_flow_buf6 = NULL;
+    g_flow_buf7 = NULL;
+    g_flow_buf8 = NULL;
+    g_flow_buf9 = NULL;
+    g_flow_buf10 = NULL;
+    g_flow_buf0_bytes = 0;
+    g_flow_buf1_bytes = 0;
+    g_flow_buf2_bytes = 0;
+    g_flow_buf3_bytes = 0;
+    g_flow_buf4_bytes = 0;
+    g_flow_buf5_bytes = 0;
+    g_flow_buf6_bytes = 0;
+    g_flow_buf7_bytes = 0;
+    g_flow_buf8_bytes = 0;
+    g_flow_buf9_bytes = 0;
+    g_flow_buf10_bytes = 0;
+    if (g_attn_q) cudaFree(g_attn_q);
+    if (g_attn_k) cudaFree(g_attn_k);
+    if (g_attn_v) cudaFree(g_attn_v);
+    if (g_attn_scores_buf) cudaFree(g_attn_scores_buf);
+    if (g_attn_out) cudaFree(g_attn_out);
+    g_attn_q = NULL;
+    g_attn_k = NULL;
+    g_attn_v = NULL;
+    g_attn_scores_buf = NULL;
+    g_attn_out = NULL;
+    g_attn_q_bytes = 0;
+    g_attn_k_bytes = 0;
+    g_attn_v_bytes = 0;
+    g_attn_scores_bytes = 0;
+    g_attn_out_bytes = 0;
     cublasDestroy(g_handle);
     g_inited = 0;
 }

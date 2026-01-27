@@ -1,6 +1,10 @@
 #include "ptts_flowlm.h"
 #include "ptts_internal.h"
 #include "ptts_kernels.h"
+#ifdef PTTS_USE_CUDA
+#include "ptts_cuda.h"
+static int attn_cuda_enabled(void);
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -240,6 +244,11 @@ static void rope_apply(float *q, float *k, int T, int H, int D, float max_period
 
 static void attention_forward(const float *q, const float *k, const float *v,
                               int T, int H, int D, float *out) {
+#ifdef PTTS_USE_CUDA
+    if (attn_cuda_enabled()) {
+        if (ptts_cuda_attention_forward(q, k, v, T, H, D, out) == 0) return;
+    }
+#endif
     float scale = 1.0f / sqrtf((float)D);
     int max_keys = T;
     float *scores = (float *)malloc((size_t)max_keys * sizeof(float));
@@ -433,6 +442,30 @@ static void timestep_embed(const ptts_time_embed *te, float t, float *out) {
     rmsnorm_forward(out, FLOWLM_FLOW_DIM, te->rms_alpha, 1e-5f, out);
 }
 
+#ifdef PTTS_USE_CUDA
+static int flow_cuda_enabled(void) {
+    static int inited = 0;
+    static int enabled = 1;
+    if (!inited) {
+        const char *v = getenv("PTTS_CUDA_FLOWNET");
+        enabled = !(v && v[0] && strcmp(v, "0") == 0);
+        inited = 1;
+    }
+    return enabled;
+}
+
+static int attn_cuda_enabled(void) {
+    static int inited = 0;
+    static int enabled = 0;
+    if (!inited) {
+        const char *v = getenv("PTTS_CUDA_ATTENTION");
+        enabled = (v && v[0] && strcmp(v, "0") != 0);
+        inited = 1;
+    }
+    return enabled;
+}
+#endif
+
 static void flow_net_forward(const ptts_flowlm *fm, const float *cond, float s, float t,
                              const float *x_in, float *out) {
     float x[FLOWLM_FLOW_DIM];
@@ -449,6 +482,42 @@ static void flow_net_forward(const ptts_flowlm *fm, const float *cond, float s, 
     float tt[FLOWLM_FLOW_DIM];
     timestep_embed(&fm->flow.time[0], s, ts);
     timestep_embed(&fm->flow.time[1], t, tt);
+
+#ifdef PTTS_USE_CUDA
+    if (flow_cuda_enabled()) {
+        ptts_cuda_flow_net_desc desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.cond_w = fm->flow.cond_w;
+        desc.cond_b = fm->flow.cond_b;
+        desc.input_w = fm->flow.input_w;
+        desc.input_b = fm->flow.input_b;
+        for (int i = 0; i < 2; i++) {
+            desc.time[i].lin0_w = fm->flow.time[i].lin0_w;
+            desc.time[i].lin0_b = fm->flow.time[i].lin0_b;
+            desc.time[i].lin2_w = fm->flow.time[i].lin2_w;
+            desc.time[i].lin2_b = fm->flow.time[i].lin2_b;
+            desc.time[i].rms_alpha = fm->flow.time[i].rms_alpha;
+            desc.time[i].freqs = fm->flow.time[i].freqs;
+        }
+        for (int i = 0; i < FLOWLM_FLOW_DEPTH; i++) {
+            desc.res[i].in_ln_w = fm->flow.res[i].in_ln_w;
+            desc.res[i].in_ln_b = fm->flow.res[i].in_ln_b;
+            desc.res[i].mlp0_w = fm->flow.res[i].mlp0_w;
+            desc.res[i].mlp0_b = fm->flow.res[i].mlp0_b;
+            desc.res[i].mlp2_w = fm->flow.res[i].mlp2_w;
+            desc.res[i].mlp2_b = fm->flow.res[i].mlp2_b;
+            desc.res[i].ada_w = fm->flow.res[i].ada_w;
+            desc.res[i].ada_b = fm->flow.res[i].ada_b;
+        }
+        desc.final.linear_w = fm->flow.final.linear_w;
+        desc.final.linear_b = fm->flow.final.linear_b;
+        desc.final.ada_w = fm->flow.final.ada_w;
+        desc.final.ada_b = fm->flow.final.ada_b;
+        if (ptts_cuda_flownet_forward(&desc, cond, ts, tt, x_in, out) == 0) {
+            return;
+        }
+    }
+#endif
 
     /* cond embed */
     linear_forward(fm->flow.cond_w, fm->flow.cond_b, FLOWLM_FLOW_DIM, FLOWLM_D_MODEL, cond, 1, tmp);

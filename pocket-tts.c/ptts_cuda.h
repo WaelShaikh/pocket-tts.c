@@ -49,6 +49,44 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
                              const float *x_host, int T,
                              float *out_host, int *out_len);
 
+typedef struct {
+    const float *cond_w;
+    const float *cond_b;
+    const float *input_w;
+    const float *input_b;
+    struct {
+        const float *lin0_w;
+        const float *lin0_b;
+        const float *lin2_w;
+        const float *lin2_b;
+        const float *rms_alpha;
+        const float *freqs;
+    } time[2];
+    struct {
+        const float *in_ln_w;
+        const float *in_ln_b;
+        const float *mlp0_w;
+        const float *mlp0_b;
+        const float *mlp2_w;
+        const float *mlp2_b;
+        const float *ada_w;
+        const float *ada_b;
+    } res[6];
+    struct {
+        const float *linear_w;
+        const float *linear_b;
+        const float *ada_w;
+        const float *ada_b;
+    } final;
+} ptts_cuda_flow_net_desc;
+
+int ptts_cuda_flownet_forward(const ptts_cuda_flow_net_desc *desc,
+                              const float *cond, const float *ts, const float *tt,
+                              const float *x_in, float *out);
+
+int ptts_cuda_attention_forward(const float *q, const float *k, const float *v,
+                                int T, int H, int D, float *out);
+
 void ptts_cuda_shutdown(void);
 
 #ifdef __cplusplus
