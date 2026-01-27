@@ -593,6 +593,7 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
 #ifdef PTTS_USE_CUDA
     {
         double t_start = 0.0;
+        int timing = ptts_timing_enabled();
         ptts_cuda_conv1d_desc dec_in = {
             mm->dec_in.w, mm->dec_in.b, mm->dec_in.in_ch, mm->dec_in.out_ch,
             mm->dec_in.k, mm->dec_in.stride, mm->dec_in.groups};
@@ -633,12 +634,12 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
             mm->dec_out.w, mm->dec_out.b, mm->dec_out.in_ch, mm->dec_out.out_ch,
             mm->dec_out.k, mm->dec_out.stride, mm->dec_out.groups};
         int cuda_len = 0;
-        if (ptts_timing_enabled()) t_start = ptts_time_ms();
+        if (timing) t_start = ptts_time_ms();
         if (ptts_cuda_mimi_convstack(&dec_in, &up0, &res0_1, &res0_2,
                                      &up1, &res1_1, &res1_2,
                                      &up2, &res2_1, &res2_2,
                                      &dec_out, up, up_len, out_audio, &cuda_len) == 0) {
-            if (ptts_timing_enabled()) {
+            if (timing) {
                 double t_end = ptts_time_ms();
                 fprintf(stderr, "[ptts] Mimi conv stack (CUDA): %.2f ms\n", t_end - t_start);
             }
@@ -646,11 +647,20 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
             free(up);
             return 0;
         }
+        if (timing) {
+            double t_end = ptts_time_ms();
+            fprintf(stderr, "[ptts] Mimi conv stack (CUDA) failed: %.2f ms, falling back to CPU\n",
+                    t_end - t_start);
+        }
     }
 #endif
 
     float *x = up;
     int T = up_len;
+
+    double t_cpu = 0.0;
+    int timing = ptts_timing_enabled();
+    if (timing) t_cpu = ptts_time_ms();
 
     float *tmp = (float *)malloc((size_t)mm->dec_in.out_ch * T * sizeof(float));
     if (!tmp) { free(up); return -1; }
@@ -697,6 +707,11 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
     if (!out) { free(x); return -1; }
     conv1d_forward_stream(&mm->dec_out, x, T, out);
     free(x);
+
+    if (timing) {
+        double t_end = ptts_time_ms();
+        fprintf(stderr, "[ptts] Mimi conv stack (CPU): %.2f ms\n", t_end - t_cpu);
+    }
 
     memcpy(out_audio, out, (size_t)T * sizeof(float));
     *out_len = T;
