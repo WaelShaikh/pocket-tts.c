@@ -14,7 +14,7 @@ MAIN = main.c
 TARGET = ptts
 LIB = libptts.a
 
-.PHONY: all clean help cpu lib info test blas cuda
+.PHONY: all clean help cpu lib info test blas cuda cuda-validate cuda-validate-test
 
 all: help
 
@@ -24,6 +24,7 @@ help:
 	@echo "  make cpu      - Pure C, no dependencies"
 	@echo "  make blas     - OpenBLAS accelerated"
 	@echo "  make cuda     - NVIDIA CUDA + cuBLAS accelerated"
+	@echo "  make cuda-validate - CUDA build with layer-by-layer validator"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make clean    - Remove build artifacts"
@@ -61,6 +62,16 @@ cuda: clean $(CUDA_OBJS) main.o
 	@echo "Built with CUDA backend (cuBLAS)"
 
 # =============================================================================
+# Backend: CUDA validate (cuBLAS + layer-by-layer validator)
+# =============================================================================
+cuda-validate: CFLAGS = $(CFLAGS_BASE) -DPTTS_USE_CUDA -DPTTS_CUDA_VALIDATE
+cuda-validate: LDFLAGS = -lm $(CUDA_LIBS)
+cuda-validate: clean $(CUDA_OBJS) main.o
+	$(CC) $(CFLAGS) -o $(TARGET) $(CUDA_OBJS) main.o $(LDFLAGS)
+	@echo ""
+	@echo "Built with CUDA backend (cuBLAS + PTTS_CUDA_VALIDATE)"
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) main.o
@@ -92,6 +103,13 @@ test: cpu
 	REF=../pocket-tts-hello-world.wav; \
 	if [ -f /home/taf2/work/pocket-tts-c/pocket-tts-hello-world.wav ]; then REF=/home/taf2/work/pocket-tts-c/pocket-tts-hello-world.wav; fi; \
 	$$PY tools/hello_world_test.py --ptts ./ptts --model-dir ./pocket-tts-model --ref $$REF --frames 17
+
+cuda-validate-test: cuda-validate
+	@PTTS_CUDA_VALIDATE=1 ./ptts -d ./pocket-tts-model -p "Hello world. This is a test." -o /tmp/ptts-validate.wav --voice alba --frames 20 --eos-min-frames 20 --seed 123 >/tmp/ptts-validate.log 2>&1; \
+	echo "Wrote /tmp/ptts-validate.log"; \
+	TH=1e-3; \
+	grep -E "CUDA validate" /tmp/ptts-validate.log || true; \
+	awk -v th=$$TH '/CUDA validate/ { if ($$NF+0 > th) { bad=1; } } END { if (bad) { print "CUDA validate: FAIL (maxdiff > " th ")"; exit 1 } else { print "CUDA validate: PASS (maxdiff <= " th ")"; } }' /tmp/ptts-validate.log
 
 # =============================================================================
 # Dependencies

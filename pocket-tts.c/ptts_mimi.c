@@ -118,6 +118,19 @@ static void conv1d_forward_stream(const ptts_conv1d *c, const float *x, int T, f
     ptts_conv1d_forward(y, x, c->w, c->b, c->in_ch, c->out_ch, T, c->k, c->stride, c->groups);
 }
 
+#ifdef PTTS_USE_CUDA
+static int cuda_conv_enabled(void) {
+    static int inited = 0;
+    static int enabled = 1;
+    if (!inited) {
+        const char *v = getenv("PTTS_CUDA_CONV");
+        enabled = !(v && v[0] && strcmp(v, "0") == 0);
+        inited = 1;
+    }
+    return enabled;
+}
+#endif
+
 static void chw_to_thw(const float *in, int C, int T, float *out) {
     for (int t = 0; t < T; t++) {
         float *row = out + (size_t)t * C;
@@ -592,6 +605,7 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
     /* decoder conv stack */
 #ifdef PTTS_USE_CUDA
     {
+        if (!cuda_conv_enabled()) goto cpu_conv;
         double t_start = 0.0;
         int timing = ptts_timing_enabled();
         ptts_cuda_conv1d_desc dec_in = {
@@ -655,6 +669,7 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
     }
 #endif
 
+cpu_conv:
     float *x = up;
     int T = up_len;
 

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ptts_kernels.h"
 
 static void cuda_log_error(const char *where, cudaError_t err) {
     if (err == cudaSuccess) return;
@@ -22,6 +23,12 @@ static void cu_log_error(const char *where, CUresult err) {
 
 static int g_cuda_debug_inited = 0;
 static int g_cuda_debug = 0;
+static int g_cuda_convtr_inited = 0;
+static int g_cuda_convtr_enabled = 1;
+static int g_cuda_conv1d_inited = 0;
+static int g_cuda_conv1d_enabled = 1;
+static int g_cuda_validate_inited = 0;
+static int g_cuda_validate_enabled = 0;
 
 static int cuda_debug_enabled(void) {
     if (!g_cuda_debug_inited) {
@@ -31,6 +38,39 @@ static int cuda_debug_enabled(void) {
     }
     return g_cuda_debug;
 }
+
+static int cuda_convtr_enabled(void) {
+    if (!g_cuda_convtr_inited) {
+        const char *v = getenv("PTTS_CUDA_CONVTR");
+        g_cuda_convtr_enabled = !(v && v[0] && strcmp(v, "0") == 0);
+        g_cuda_convtr_inited = 1;
+    }
+    return g_cuda_convtr_enabled;
+}
+
+static int cuda_conv1d_enabled(void) {
+    if (!g_cuda_conv1d_inited) {
+        const char *v = getenv("PTTS_CUDA_CONV1D");
+        g_cuda_conv1d_enabled = !(v && v[0] && strcmp(v, "0") == 0);
+        g_cuda_conv1d_inited = 1;
+    }
+    return g_cuda_conv1d_enabled;
+}
+
+#ifdef PTTS_CUDA_VALIDATE
+static int cuda_validate_enabled(void) {
+    if (!g_cuda_validate_inited) {
+        const char *v = getenv("PTTS_CUDA_VALIDATE");
+        g_cuda_validate_enabled = (v && v[0] && strcmp(v, "0") != 0);
+        g_cuda_validate_inited = 1;
+    }
+    return g_cuda_validate_enabled;
+}
+#else
+static int cuda_validate_enabled(void) {
+    return 0;
+}
+#endif
 
 static int cuda_check(const char *where) {
     if (!cuda_debug_enabled()) return 0;
@@ -146,7 +186,7 @@ static int ensure_kernels(void) {
         "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
         "  if (i >= n) return;\n"
         "  float v = x[i];\n"
-        "  x[i] = v >= 0.0f ? v : __expf(v) - 1.0f;\n"
+        "  x[i] = v >= 0.0f ? v : expf(v) - 1.0f;\n"
         "}\n"
         "extern \"C\" __global__ void add_kernel(float* a, const float* b, int n) {\n"
         "  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
@@ -457,6 +497,154 @@ static int add_device(float *a, const float *b, int n) {
     return 0;
 }
 
+static int convtr1d_host_fallback(float *d_y, const float *d_x,
+                                  const float *w, const float *b,
+                                  int in_ch, int out_ch, int T, int k, int stride, int groups,
+                                  int out_len) {
+    size_t x_bytes = (size_t)in_ch * T * sizeof(float);
+    size_t y_bytes = (size_t)out_ch * out_len * sizeof(float);
+    float *h_x = (float *)malloc(x_bytes);
+    float *h_y = (float *)malloc(y_bytes);
+    if (!h_x || !h_y) { free(h_x); free(h_y); return -1; }
+    if (cudaMemcpy(h_x, d_x, x_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cuda_log_error("cudaMemcpy(convtr host x)", cudaGetLastError());
+        free(h_x); free(h_y); return -1;
+    }
+    ptts_convtr1d_forward(h_y, h_x, w, b, in_ch, out_ch, T, k, stride, groups);
+    if (cudaMemcpy(d_y, h_y, y_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cuda_log_error("cudaMemcpy(convtr host y)", cudaGetLastError());
+        free(h_x); free(h_y); return -1;
+    }
+    free(h_x);
+    free(h_y);
+    return 0;
+}
+
+static int conv1d_host_fallback(float *d_y, const float *d_x,
+                                const float *w, const float *b,
+                                int in_ch, int out_ch, int T, int k, int stride, int groups,
+                                int out_len) {
+    size_t x_bytes = (size_t)in_ch * T * sizeof(float);
+    size_t y_bytes = (size_t)out_ch * out_len * sizeof(float);
+    float *h_x = (float *)malloc(x_bytes);
+    float *h_y = (float *)malloc(y_bytes);
+    if (!h_x || !h_y) { free(h_x); free(h_y); return -1; }
+    if (cudaMemcpy(h_x, d_x, x_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cuda_log_error("cudaMemcpy(conv1d host x)", cudaGetLastError());
+        free(h_x); free(h_y); return -1;
+    }
+    ptts_conv1d_forward(h_y, h_x, w, b, in_ch, out_ch, T, k, stride, groups);
+    if (cudaMemcpy(d_y, h_y, y_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cuda_log_error("cudaMemcpy(conv1d host y)", cudaGetLastError());
+        free(h_x); free(h_y); return -1;
+    }
+    free(h_x);
+    free(h_y);
+    return 0;
+}
+
+static void cpu_conv1d_forward(float *y, const float *x, const float *w, const float *b,
+                               int in_ch, int out_ch, int T, int k, int stride, int groups) {
+    int out_len = T / stride;
+    int in_per_group = in_ch / groups;
+    int out_per_group = out_ch / groups;
+    int left_pad = k - stride;
+
+    for (int oc = 0; oc < out_ch; oc++) {
+        int g = oc / out_per_group;
+        int in_base = g * in_per_group;
+        const float *wbase = w + (size_t)oc * in_per_group * k;
+        float bias = b ? b[oc] : 0.0f;
+        for (int t = 0; t < out_len; t++) {
+            float sum = bias;
+            int in_start = t * stride - left_pad;
+            for (int ic = 0; ic < in_per_group; ic++) {
+                const float *wrow = wbase + ic * k;
+                const float *xch = x + (size_t)(in_base + ic) * T;
+                for (int kk = 0; kk < k; kk++) {
+                    int idx = in_start + kk;
+                    if (idx < 0 || idx >= T) continue;
+                    sum += wrow[kk] * xch[idx];
+                }
+            }
+            y[(size_t)oc * out_len + t] = sum;
+        }
+    }
+}
+
+static void cpu_convtr1d_forward(float *y, const float *x, const float *w, const float *b,
+                                 int in_ch, int out_ch, int T, int k, int stride, int groups) {
+    int full_len = (T - 1) * stride + k;
+    int out_len = full_len - (k - stride);
+    int out_per_group = out_ch / groups;
+    int in_per_group = in_ch / groups;
+
+    memset(y, 0, (size_t)out_ch * out_len * sizeof(float));
+
+    for (int ic = 0; ic < in_ch; ic++) {
+        int g = ic / in_per_group;
+        int out_base = g * out_per_group;
+        const float *wbase = w + (size_t)ic * out_per_group * k;
+        const float *xch = x + (size_t)ic * T;
+        for (int t = 0; t < T; t++) {
+            int out_start = t * stride;
+            for (int ocg = 0; ocg < out_per_group; ocg++) {
+                const float *wrow = wbase + ocg * k;
+                float *ych = y + (size_t)(out_base + ocg) * out_len;
+                for (int kk = 0; kk < k; kk++) {
+                    int idx = out_start + kk;
+                    if (idx >= out_len) continue;
+                    ych[idx] += wrow[kk] * xch[t];
+                }
+            }
+        }
+    }
+    if (b) {
+        for (int oc = 0; oc < out_ch; oc++) {
+            float bias = b[oc];
+            float *ych = y + (size_t)oc * out_len;
+            for (int t = 0; t < out_len; t++) ych[t] += bias;
+        }
+    }
+}
+
+static void cpu_elu_inplace(float *x, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = x[i];
+        x[i] = v >= 0.0f ? v : expf(v) - 1.0f;
+    }
+}
+
+static void cpu_add_inplace(float *a, const float *b, int n) {
+    for (int i = 0; i < n; i++) a[i] += b[i];
+}
+
+static int ensure_host_buffer(float **buf, size_t *cap, size_t bytes) {
+    if (*cap >= bytes && *buf) return 0;
+    float *next = (float *)realloc(*buf, bytes);
+    if (!next) return -1;
+    *buf = next;
+    *cap = bytes;
+    return 0;
+}
+
+static void compare_gpu_cpu(const char *label, const float *d_buf, const float *h_ref,
+                            int n, float **h_tmp, size_t *cap) {
+    size_t bytes = (size_t)n * sizeof(float);
+    if (ensure_host_buffer(h_tmp, cap, bytes) != 0) return;
+    if (cudaMemcpy(*h_tmp, d_buf, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cuda_log_error("cudaMemcpy(compare)", cudaGetLastError());
+        return;
+    }
+    float maxd = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = (*h_tmp)[i] - h_ref[i];
+        if (d < 0.0f) d = -d;
+        if (d > maxd) maxd = d;
+    }
+    fprintf(stderr, "[ptts] CUDA validate %-10s maxdiff=%.6f\n", label, maxd);
+}
+
 int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
                              const ptts_cuda_convtr1d_desc *up0,
                              const ptts_cuda_conv1d_desc *res0_1,
@@ -485,6 +673,21 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     float *d_y = g_conv_buf1;
     float *d_tmp1 = g_conv_buf2;
     float *d_tmp2 = g_conv_buf3;
+    float *h_x = NULL;
+    float *h_y = NULL;
+    float *h_tmp1 = NULL;
+    float *h_tmp2 = NULL;
+    float *h_gpu = NULL;
+    size_t h_x_cap = 0;
+    size_t h_y_cap = 0;
+    size_t h_tmp1_cap = 0;
+    size_t h_tmp2_cap = 0;
+    size_t h_gpu_cap = 0;
+    int validate = cuda_validate_enabled();
+    if (validate) {
+        if (ensure_host_buffer(&h_x, &h_x_cap, x_bytes) != 0) return -1;
+        memcpy(h_x, x_host, x_bytes);
+    }
     if (cudaMemcpy(d_x, x_host, x_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         cuda_log_error("cudaMemcpy(convstack x)", cudaGetLastError());
         return -1;
@@ -499,13 +702,32 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     float *d_b = dec_in->b ? get_weight_device(dec_in->b, (size_t)dec_in->out_ch * sizeof(float)) : NULL;
     if (!d_w) return -1;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: dec_in\n");
-    if (conv1d_device(d_y, d_x, d_w, d_b, dec_in->in_ch, dec_in->out_ch, t, dec_in->k, dec_in->stride, dec_in->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_y, d_x, d_w, d_b, dec_in->in_ch, dec_in->out_ch, t, dec_in->k, dec_in->stride, dec_in->groups) != 0) {
+            return -1;
+        }
+    } else {
+        if (conv1d_host_fallback(d_y, d_x, dec_in->w, dec_in->b, dec_in->in_ch, dec_in->out_ch,
+                                 t, dec_in->k, dec_in->stride, dec_in->groups, out_t) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)dec_in->out_ch * out_t * sizeof(float);
+        if (ensure_host_buffer(&h_y, &h_y_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_y, h_x, dec_in->w, dec_in->b, dec_in->in_ch, dec_in->out_ch, t,
+                           dec_in->k, dec_in->stride, dec_in->groups);
+        compare_gpu_cpu("dec_in", d_y, h_y, dec_in->out_ch * out_t, &h_gpu, &h_gpu_cap);
+        float *swap = h_x; h_x = h_y; h_y = swap;
     }
     d_x = d_y;
     t = out_t;
 
     if (elu_device(d_x, dec_in->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_elu_inplace(h_x, dec_in->out_ch * t);
+        compare_gpu_cpu("elu0", d_x, h_x, dec_in->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
 
     out_t = t * up0->stride;
     y_bytes = (size_t)up0->out_ch * out_t * sizeof(float);
@@ -515,8 +737,23 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     d_b = up0->b ? get_weight_device(up0->b, (size_t)up0->out_ch * sizeof(float)) : NULL;
     if (!d_w) return -1;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: up0\n");
-    if (convtr1d_device(d_y, d_x, d_w, d_b, up0->in_ch, up0->out_ch, t, up0->k, up0->stride, up0->groups) != 0) {
-        return -1;
+    if (cuda_convtr_enabled()) {
+        if (convtr1d_device(d_y, d_x, d_w, d_b, up0->in_ch, up0->out_ch, t, up0->k, up0->stride, up0->groups) != 0) {
+            return -1;
+        }
+    } else {
+        if (convtr1d_host_fallback(d_y, d_x, up0->w, up0->b, up0->in_ch, up0->out_ch,
+                                   t, up0->k, up0->stride, up0->groups, out_t) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)up0->out_ch * out_t * sizeof(float);
+        if (ensure_host_buffer(&h_y, &h_y_cap, bytes) != 0) return -1;
+        cpu_convtr1d_forward(h_y, h_x, up0->w, up0->b, up0->in_ch, up0->out_ch, t,
+                             up0->k, up0->stride, up0->groups);
+        compare_gpu_cpu("up0", d_y, h_y, up0->out_ch * out_t, &h_gpu, &h_gpu_cap);
+        float *swap = h_x; h_x = h_y; h_y = swap;
     }
     d_x = d_y;
     t = out_t;
@@ -531,23 +768,71 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
         cuda_log_error("cudaMemcpy(convstack tmp1)", cudaGetLastError());
         return -1;
     }
-    if (elu_device(d_tmp1, res0_1->out_ch * t) != 0) return -1;
+    if (elu_device(d_tmp1, res0_1->in_ch * t) != 0) return -1;
+    if (validate) {
+        if (ensure_host_buffer(&h_tmp1, &h_tmp1_cap, tmp1_bytes) != 0) return -1;
+        memcpy(h_tmp1, h_x, tmp1_bytes);
+        cpu_elu_inplace(h_tmp1, res0_1->in_ch * t);
+        compare_gpu_cpu("res0_elu1", d_tmp1, h_tmp1, res0_1->in_ch * t, &h_gpu, &h_gpu_cap);
+    }
     d_w = get_weight_device(res0_1->w, (size_t)res0_1->out_ch * (res0_1->in_ch / res0_1->groups) * res0_1->k * sizeof(float));
     d_b = res0_1->b ? get_weight_device(res0_1->b, (size_t)res0_1->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: res0_1\n");
-    if (conv1d_device(d_tmp2, d_tmp1, d_w, d_b, res0_1->in_ch, res0_1->out_ch, t, res0_1->k, res0_1->stride, res0_1->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_tmp2, d_tmp1, d_w, d_b, res0_1->in_ch, res0_1->out_ch, t, res0_1->k, res0_1->stride, res0_1->groups) != 0) {
+            return -1;
+        }
+    } else {
+        int out_len = t / res0_1->stride;
+        if (conv1d_host_fallback(d_tmp2, d_tmp1, res0_1->w, res0_1->b, res0_1->in_ch, res0_1->out_ch,
+                                 t, res0_1->k, res0_1->stride, res0_1->groups, out_len) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)res0_1->out_ch * t * sizeof(float);
+        if (ensure_host_buffer(&h_tmp2, &h_tmp2_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_tmp2, h_tmp1, res0_1->w, res0_1->b, res0_1->in_ch, res0_1->out_ch,
+                           t, res0_1->k, res0_1->stride, res0_1->groups);
+        compare_gpu_cpu("res0_1", d_tmp2, h_tmp2, res0_1->out_ch * t, &h_gpu, &h_gpu_cap);
     }
     if (elu_device(d_tmp2, res0_1->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_elu_inplace(h_tmp2, res0_1->out_ch * t);
+        compare_gpu_cpu("res0_elu2", d_tmp2, h_tmp2, res0_1->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
     d_w = get_weight_device(res0_2->w, (size_t)res0_2->out_ch * (res0_2->in_ch / res0_2->groups) * res0_2->k * sizeof(float));
     d_b = res0_2->b ? get_weight_device(res0_2->b, (size_t)res0_2->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: res0_2\n");
-    if (conv1d_device(d_tmp1, d_tmp2, d_w, d_b, res0_2->in_ch, res0_2->out_ch, t, res0_2->k, res0_2->stride, res0_2->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_tmp1, d_tmp2, d_w, d_b, res0_2->in_ch, res0_2->out_ch, t, res0_2->k, res0_2->stride, res0_2->groups) != 0) {
+            return -1;
+        }
+    } else {
+        int out_len = t / res0_2->stride;
+        if (conv1d_host_fallback(d_tmp1, d_tmp2, res0_2->w, res0_2->b, res0_2->in_ch, res0_2->out_ch,
+                                 t, res0_2->k, res0_2->stride, res0_2->groups, out_len) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)res0_2->out_ch * t * sizeof(float);
+        if (ensure_host_buffer(&h_tmp1, &h_tmp1_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_tmp1, h_tmp2, res0_2->w, res0_2->b, res0_2->in_ch, res0_2->out_ch,
+                           t, res0_2->k, res0_2->stride, res0_2->groups);
+        compare_gpu_cpu("res0_2", d_tmp1, h_tmp1, res0_2->out_ch * t, &h_gpu, &h_gpu_cap);
     }
     if (add_device(d_x, d_tmp1, res0_2->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_add_inplace(h_x, h_tmp1, res0_2->out_ch * t);
+        compare_gpu_cpu("res0_add", d_x, h_x, res0_2->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
 
     if (elu_device(d_x, res0_2->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_elu_inplace(h_x, res0_2->out_ch * t);
+        compare_gpu_cpu("res0_elu3", d_x, h_x, res0_2->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
 
     out_t = t * up1->stride;
     y_bytes = (size_t)up1->out_ch * out_t * sizeof(float);
@@ -556,8 +841,23 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     d_w = get_weight_device(up1->w, (size_t)up1->in_ch * (up1->out_ch / up1->groups) * up1->k * sizeof(float));
     d_b = up1->b ? get_weight_device(up1->b, (size_t)up1->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: up1\n");
-    if (convtr1d_device(d_y, d_x, d_w, d_b, up1->in_ch, up1->out_ch, t, up1->k, up1->stride, up1->groups) != 0) {
-        return -1;
+    if (cuda_convtr_enabled()) {
+        if (convtr1d_device(d_y, d_x, d_w, d_b, up1->in_ch, up1->out_ch, t, up1->k, up1->stride, up1->groups) != 0) {
+            return -1;
+        }
+    } else {
+        if (convtr1d_host_fallback(d_y, d_x, up1->w, up1->b, up1->in_ch, up1->out_ch,
+                                   t, up1->k, up1->stride, up1->groups, out_t) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)up1->out_ch * out_t * sizeof(float);
+        if (ensure_host_buffer(&h_y, &h_y_cap, bytes) != 0) return -1;
+        cpu_convtr1d_forward(h_y, h_x, up1->w, up1->b, up1->in_ch, up1->out_ch, t,
+                             up1->k, up1->stride, up1->groups);
+        compare_gpu_cpu("up1", d_y, h_y, up1->out_ch * out_t, &h_gpu, &h_gpu_cap);
+        float *swap = h_x; h_x = h_y; h_y = swap;
     }
     d_x = d_y;
     t = out_t;
@@ -572,23 +872,71 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
         cuda_log_error("cudaMemcpy(convstack tmp1 stage1)", cudaGetLastError());
         return -1;
     }
-    if (elu_device(d_tmp1, res1_1->out_ch * t) != 0) return -1;
+    if (elu_device(d_tmp1, res1_1->in_ch * t) != 0) return -1;
+    if (validate) {
+        if (ensure_host_buffer(&h_tmp1, &h_tmp1_cap, tmp1_bytes) != 0) return -1;
+        memcpy(h_tmp1, h_x, tmp1_bytes);
+        cpu_elu_inplace(h_tmp1, res1_1->in_ch * t);
+        compare_gpu_cpu("res1_elu1", d_tmp1, h_tmp1, res1_1->in_ch * t, &h_gpu, &h_gpu_cap);
+    }
     d_w = get_weight_device(res1_1->w, (size_t)res1_1->out_ch * (res1_1->in_ch / res1_1->groups) * res1_1->k * sizeof(float));
     d_b = res1_1->b ? get_weight_device(res1_1->b, (size_t)res1_1->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: res1_1\n");
-    if (conv1d_device(d_tmp2, d_tmp1, d_w, d_b, res1_1->in_ch, res1_1->out_ch, t, res1_1->k, res1_1->stride, res1_1->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_tmp2, d_tmp1, d_w, d_b, res1_1->in_ch, res1_1->out_ch, t, res1_1->k, res1_1->stride, res1_1->groups) != 0) {
+            return -1;
+        }
+    } else {
+        int out_len = t / res1_1->stride;
+        if (conv1d_host_fallback(d_tmp2, d_tmp1, res1_1->w, res1_1->b, res1_1->in_ch, res1_1->out_ch,
+                                 t, res1_1->k, res1_1->stride, res1_1->groups, out_len) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)res1_1->out_ch * t * sizeof(float);
+        if (ensure_host_buffer(&h_tmp2, &h_tmp2_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_tmp2, h_tmp1, res1_1->w, res1_1->b, res1_1->in_ch, res1_1->out_ch,
+                           t, res1_1->k, res1_1->stride, res1_1->groups);
+        compare_gpu_cpu("res1_1", d_tmp2, h_tmp2, res1_1->out_ch * t, &h_gpu, &h_gpu_cap);
     }
     if (elu_device(d_tmp2, res1_1->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_elu_inplace(h_tmp2, res1_1->out_ch * t);
+        compare_gpu_cpu("res1_elu2", d_tmp2, h_tmp2, res1_1->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
     d_w = get_weight_device(res1_2->w, (size_t)res1_2->out_ch * (res1_2->in_ch / res1_2->groups) * res1_2->k * sizeof(float));
     d_b = res1_2->b ? get_weight_device(res1_2->b, (size_t)res1_2->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: res1_2\n");
-    if (conv1d_device(d_tmp1, d_tmp2, d_w, d_b, res1_2->in_ch, res1_2->out_ch, t, res1_2->k, res1_2->stride, res1_2->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_tmp1, d_tmp2, d_w, d_b, res1_2->in_ch, res1_2->out_ch, t, res1_2->k, res1_2->stride, res1_2->groups) != 0) {
+            return -1;
+        }
+    } else {
+        int out_len = t / res1_2->stride;
+        if (conv1d_host_fallback(d_tmp1, d_tmp2, res1_2->w, res1_2->b, res1_2->in_ch, res1_2->out_ch,
+                                 t, res1_2->k, res1_2->stride, res1_2->groups, out_len) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)res1_2->out_ch * t * sizeof(float);
+        if (ensure_host_buffer(&h_tmp1, &h_tmp1_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_tmp1, h_tmp2, res1_2->w, res1_2->b, res1_2->in_ch, res1_2->out_ch,
+                           t, res1_2->k, res1_2->stride, res1_2->groups);
+        compare_gpu_cpu("res1_2", d_tmp1, h_tmp1, res1_2->out_ch * t, &h_gpu, &h_gpu_cap);
     }
     if (add_device(d_x, d_tmp1, res1_2->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_add_inplace(h_x, h_tmp1, res1_2->out_ch * t);
+        compare_gpu_cpu("res1_add", d_x, h_x, res1_2->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
 
     if (elu_device(d_x, res1_2->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_elu_inplace(h_x, res1_2->out_ch * t);
+        compare_gpu_cpu("res1_elu3", d_x, h_x, res1_2->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
 
     out_t = t * up2->stride;
     y_bytes = (size_t)up2->out_ch * out_t * sizeof(float);
@@ -597,8 +945,23 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     d_w = get_weight_device(up2->w, (size_t)up2->in_ch * (up2->out_ch / up2->groups) * up2->k * sizeof(float));
     d_b = up2->b ? get_weight_device(up2->b, (size_t)up2->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: up2\n");
-    if (convtr1d_device(d_y, d_x, d_w, d_b, up2->in_ch, up2->out_ch, t, up2->k, up2->stride, up2->groups) != 0) {
-        return -1;
+    if (cuda_convtr_enabled()) {
+        if (convtr1d_device(d_y, d_x, d_w, d_b, up2->in_ch, up2->out_ch, t, up2->k, up2->stride, up2->groups) != 0) {
+            return -1;
+        }
+    } else {
+        if (convtr1d_host_fallback(d_y, d_x, up2->w, up2->b, up2->in_ch, up2->out_ch,
+                                   t, up2->k, up2->stride, up2->groups, out_t) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)up2->out_ch * out_t * sizeof(float);
+        if (ensure_host_buffer(&h_y, &h_y_cap, bytes) != 0) return -1;
+        cpu_convtr1d_forward(h_y, h_x, up2->w, up2->b, up2->in_ch, up2->out_ch, t,
+                             up2->k, up2->stride, up2->groups);
+        compare_gpu_cpu("up2", d_y, h_y, up2->out_ch * out_t, &h_gpu, &h_gpu_cap);
+        float *swap = h_x; h_x = h_y; h_y = swap;
     }
     d_x = d_y;
     t = out_t;
@@ -613,23 +976,71 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
         cuda_log_error("cudaMemcpy(convstack tmp1 stage2)", cudaGetLastError());
         return -1;
     }
-    if (elu_device(d_tmp1, res2_1->out_ch * t) != 0) return -1;
+    if (elu_device(d_tmp1, res2_1->in_ch * t) != 0) return -1;
+    if (validate) {
+        if (ensure_host_buffer(&h_tmp1, &h_tmp1_cap, tmp1_bytes) != 0) return -1;
+        memcpy(h_tmp1, h_x, tmp1_bytes);
+        cpu_elu_inplace(h_tmp1, res2_1->in_ch * t);
+        compare_gpu_cpu("res2_elu1", d_tmp1, h_tmp1, res2_1->in_ch * t, &h_gpu, &h_gpu_cap);
+    }
     d_w = get_weight_device(res2_1->w, (size_t)res2_1->out_ch * (res2_1->in_ch / res2_1->groups) * res2_1->k * sizeof(float));
     d_b = res2_1->b ? get_weight_device(res2_1->b, (size_t)res2_1->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: res2_1\n");
-    if (conv1d_device(d_tmp2, d_tmp1, d_w, d_b, res2_1->in_ch, res2_1->out_ch, t, res2_1->k, res2_1->stride, res2_1->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_tmp2, d_tmp1, d_w, d_b, res2_1->in_ch, res2_1->out_ch, t, res2_1->k, res2_1->stride, res2_1->groups) != 0) {
+            return -1;
+        }
+    } else {
+        int out_len = t / res2_1->stride;
+        if (conv1d_host_fallback(d_tmp2, d_tmp1, res2_1->w, res2_1->b, res2_1->in_ch, res2_1->out_ch,
+                                 t, res2_1->k, res2_1->stride, res2_1->groups, out_len) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)res2_1->out_ch * t * sizeof(float);
+        if (ensure_host_buffer(&h_tmp2, &h_tmp2_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_tmp2, h_tmp1, res2_1->w, res2_1->b, res2_1->in_ch, res2_1->out_ch,
+                           t, res2_1->k, res2_1->stride, res2_1->groups);
+        compare_gpu_cpu("res2_1", d_tmp2, h_tmp2, res2_1->out_ch * t, &h_gpu, &h_gpu_cap);
     }
     if (elu_device(d_tmp2, res2_1->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_elu_inplace(h_tmp2, res2_1->out_ch * t);
+        compare_gpu_cpu("res2_elu2", d_tmp2, h_tmp2, res2_1->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
     d_w = get_weight_device(res2_2->w, (size_t)res2_2->out_ch * (res2_2->in_ch / res2_2->groups) * res2_2->k * sizeof(float));
     d_b = res2_2->b ? get_weight_device(res2_2->b, (size_t)res2_2->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: res2_2\n");
-    if (conv1d_device(d_tmp1, d_tmp2, d_w, d_b, res2_2->in_ch, res2_2->out_ch, t, res2_2->k, res2_2->stride, res2_2->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_tmp1, d_tmp2, d_w, d_b, res2_2->in_ch, res2_2->out_ch, t, res2_2->k, res2_2->stride, res2_2->groups) != 0) {
+            return -1;
+        }
+    } else {
+        int out_len = t / res2_2->stride;
+        if (conv1d_host_fallback(d_tmp1, d_tmp2, res2_2->w, res2_2->b, res2_2->in_ch, res2_2->out_ch,
+                                 t, res2_2->k, res2_2->stride, res2_2->groups, out_len) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)res2_2->out_ch * t * sizeof(float);
+        if (ensure_host_buffer(&h_tmp1, &h_tmp1_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_tmp1, h_tmp2, res2_2->w, res2_2->b, res2_2->in_ch, res2_2->out_ch,
+                           t, res2_2->k, res2_2->stride, res2_2->groups);
+        compare_gpu_cpu("res2_2", d_tmp1, h_tmp1, res2_2->out_ch * t, &h_gpu, &h_gpu_cap);
     }
     if (add_device(d_x, d_tmp1, res2_2->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_add_inplace(h_x, h_tmp1, res2_2->out_ch * t);
+        compare_gpu_cpu("res2_add", d_x, h_x, res2_2->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
 
     if (elu_device(d_x, res2_2->out_ch * t) != 0) return -1;
+    if (validate) {
+        cpu_elu_inplace(h_x, res2_2->out_ch * t);
+        compare_gpu_cpu("res2_elu3", d_x, h_x, res2_2->out_ch * t, &h_gpu, &h_gpu_cap);
+    }
 
     out_t = t / dec_out->stride;
     y_bytes = (size_t)dec_out->out_ch * out_t * sizeof(float);
@@ -638,13 +1049,35 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     d_w = get_weight_device(dec_out->w, (size_t)dec_out->out_ch * (dec_out->in_ch / dec_out->groups) * dec_out->k * sizeof(float));
     d_b = dec_out->b ? get_weight_device(dec_out->b, (size_t)dec_out->out_ch * sizeof(float)) : NULL;
     if (cuda_debug_enabled()) fprintf(stderr, "[ptts] CUDA convstack: dec_out\n");
-    if (conv1d_device(d_y, d_x, d_w, d_b, dec_out->in_ch, dec_out->out_ch, t, dec_out->k, dec_out->stride, dec_out->groups) != 0) {
-        return -1;
+    if (cuda_conv1d_enabled()) {
+        if (conv1d_device(d_y, d_x, d_w, d_b, dec_out->in_ch, dec_out->out_ch, t, dec_out->k, dec_out->stride, dec_out->groups) != 0) {
+            return -1;
+        }
+    } else {
+        if (conv1d_host_fallback(d_y, d_x, dec_out->w, dec_out->b, dec_out->in_ch, dec_out->out_ch,
+                                 t, dec_out->k, dec_out->stride, dec_out->groups, out_t) != 0) {
+            return -1;
+        }
+    }
+    if (validate) {
+        size_t bytes = (size_t)dec_out->out_ch * out_t * sizeof(float);
+        if (ensure_host_buffer(&h_y, &h_y_cap, bytes) != 0) return -1;
+        cpu_conv1d_forward(h_y, h_x, dec_out->w, dec_out->b, dec_out->in_ch, dec_out->out_ch,
+                           t, dec_out->k, dec_out->stride, dec_out->groups);
+        compare_gpu_cpu("dec_out", d_y, h_y, dec_out->out_ch * out_t, &h_gpu, &h_gpu_cap);
+        float *swap = h_x; h_x = h_y; h_y = swap;
     }
 
     if (cudaMemcpy(out_host, d_y, y_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
         cuda_log_error("cudaMemcpy(convstack out)", cudaGetLastError());
         return -1;
+    }
+    if (validate) {
+        free(h_x);
+        free(h_y);
+        free(h_tmp1);
+        free(h_tmp2);
+        free(h_gpu);
     }
     *out_len = out_t;
     return 0;
