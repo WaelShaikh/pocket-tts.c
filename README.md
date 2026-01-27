@@ -28,11 +28,7 @@ CUDA builds require the CUDA toolkit + cuBLAS + NVRTC.
 
 ## Sample Audio
 
-Included: `sample.wav`
-
-Play it inline (GitHub supports `<audio>`):
-
-<audio controls src="sample.wav"></audio>
+<!-- <video src="..." controls></video> -->
 
 Or locally:
 
