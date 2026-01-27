@@ -28,7 +28,7 @@ CUDA builds require the CUDA toolkit + cuBLAS + NVRTC.
 
 ## Sample Audio
 
-<!-- <video src="..." controls></video> -->
+<video src="https://github.com/user-attachments/assets/adcf2f2e-ffee-4b0e-a98a-f174bb06b4d9" controls></video>
 
 Or locally:
 
