@@ -105,7 +105,7 @@ test: cpu
 	$$PY tools/hello_world_test.py --ptts ./ptts --model-dir ./pocket-tts-model --ref $$REF --frames 17
 
 cuda-validate-test: cuda-validate
-	@PTTS_CUDA_VALIDATE=1 ./ptts -d ./pocket-tts-model -p "Hello world. This is a test." -o /tmp/ptts-validate.wav --voice alba --frames 20 --eos-min-frames 20 --seed 123 >/tmp/ptts-validate.log 2>&1; \
+	@PTTS_CUDA_VALIDATE=1 PTTS_CUDA_ATTENTION=1 PTTS_CUDA_ATTN_MIN_T=0 ./ptts -d ./pocket-tts-model -p "Hello world. This is a test." -o /tmp/ptts-validate.wav --voice alba --frames 20 --eos-min-frames 20 --seed 123 >/tmp/ptts-validate.log 2>&1; \
 	echo "Wrote /tmp/ptts-validate.log"; \
 	TH=1e-3; \
 	grep -E "CUDA validate" /tmp/ptts-validate.log || true; \

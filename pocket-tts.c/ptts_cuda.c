@@ -12,6 +12,9 @@
 #define FLOWLM_FLOW_DIM 512
 #define FLOWLM_LATENT_DIM 32
 #define FLOWLM_D_MODEL 1024
+#define FLOWLM_NUM_LAYERS 6
+#define FLOWLM_NUM_HEADS 16
+#define FLOWLM_HEAD_DIM 64
 
 static void cuda_log_error(const char *where, cudaError_t err) {
     if (err == cudaSuccess) return;
@@ -135,6 +138,7 @@ static CUfunction g_attn_scores;
 static CUfunction g_attn_softmax;
 static CUfunction g_attn_apply;
 static CUfunction g_attn_fused;
+static CUfunction g_attn_step;
 static int g_kernels_ready = 0;
 static float *g_conv_buf0 = NULL;
 static float *g_conv_buf1 = NULL;
@@ -176,6 +180,10 @@ static size_t g_attn_k_bytes = 0;
 static size_t g_attn_v_bytes = 0;
 static size_t g_attn_scores_bytes = 0;
 static size_t g_attn_out_bytes = 0;
+static float *g_k_cache_dev[FLOWLM_NUM_LAYERS];
+static float *g_v_cache_dev[FLOWLM_NUM_LAYERS];
+static size_t g_kv_cache_bytes = 0;
+static int g_kv_cache_max_len = 0;
 
 static int ensure_kernels(void) {
     if (g_kernels_ready) return 0;
@@ -183,6 +191,25 @@ static int ensure_kernels(void) {
     if (cuerr != CUDA_SUCCESS) {
         cu_log_error("cuInit", cuerr);
         return -1;
+    }
+    CUcontext ctx = NULL;
+    cuerr = cuCtxGetCurrent(&ctx);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuCtxGetCurrent", cuerr);
+        return -1;
+    }
+    if (!ctx) {
+        CUdevice cu_dev;
+        cuerr = cuDeviceGet(&cu_dev, 0);
+        if (cuerr != CUDA_SUCCESS) {
+            cu_log_error("cuDeviceGet", cuerr);
+            return -1;
+        }
+        cuerr = cuCtxCreate(&ctx, 0, cu_dev);
+        if (cuerr != CUDA_SUCCESS) {
+            cu_log_error("cuCtxCreate", cuerr);
+            return -1;
+        }
     }
 
     int dev = 0;
@@ -427,6 +454,37 @@ static int ensure_kernels(void) {
         "    const float* vv = v + ((tk * H + h) * D);\n"
         "    for (int d = 0; d < D; d++) outv[d] += w * vv[d];\n"
         "  }\n"
+        "}\n"
+        "extern \"C\" __global__ void attn_step_kernel(const float* q, const float* k, const float* v, float* out, int T, int H, int D, float scale) {\n"
+        "  int h = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n"
+        "  if (h >= H) return;\n"
+        "  const float* qv = q + h * D;\n"
+        "  float maxv = -1e30f;\n"
+        "  for (int tk = 0; tk < T; tk++) {\n"
+        "    const float* kv = k + ((tk * H + h) * D);\n"
+        "    float dot = 0.0f;\n"
+        "    for (int d = 0; d < D; d++) dot += qv[d] * kv[d];\n"
+        "    float s = dot * scale;\n"
+        "    if (s > maxv) maxv = s;\n"
+        "  }\n"
+        "  float sum = 0.0f;\n"
+        "  for (int tk = 0; tk < T; tk++) {\n"
+        "    const float* kv = k + ((tk * H + h) * D);\n"
+        "    float dot = 0.0f;\n"
+        "    for (int d = 0; d < D; d++) dot += qv[d] * kv[d];\n"
+        "    sum += expf(dot * scale - maxv);\n"
+        "  }\n"
+        "  float inv = 1.0f / sum;\n"
+        "  float* outv = out + h * D;\n"
+        "  for (int d = 0; d < D; d++) outv[d] = 0.0f;\n"
+        "  for (int tk = 0; tk < T; tk++) {\n"
+        "    const float* kv = k + ((tk * H + h) * D);\n"
+        "    float dot = 0.0f;\n"
+        "    for (int d = 0; d < D; d++) dot += qv[d] * kv[d];\n"
+        "    float w = expf(dot * scale - maxv) * inv;\n"
+        "    const float* vv = v + ((tk * H + h) * D);\n"
+        "    for (int d = 0; d < D; d++) outv[d] += w * vv[d];\n"
+        "  }\n"
         "}\n";
 
     nvrtcProgram prog;
@@ -495,6 +553,8 @@ static int ensure_kernels(void) {
     if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(attn_apply)", cuerr); return -1; }
     cuerr = cuModuleGetFunction(&g_attn_fused, g_mod, "attn_fused_kernel");
     if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(attn_fused)", cuerr); return -1; }
+    cuerr = cuModuleGetFunction(&g_attn_step, g_mod, "attn_step_kernel");
+    if (cuerr != CUDA_SUCCESS) { cu_log_error("cuModuleGetFunction(attn_step)", cuerr); return -1; }
 
     g_kernels_ready = 1;
     return 0;
@@ -517,6 +577,31 @@ static int ensure_device_buffer(float **buf, size_t *cap, size_t bytes) {
 
 static int ensure_conv_buffer(float **buf, size_t *cap, size_t bytes) {
     return ensure_device_buffer(buf, cap, bytes);
+}
+
+static int ensure_kv_cache(int max_len) {
+    if (g_kv_cache_max_len >= max_len && g_kv_cache_bytes > 0) return 0;
+    for (int i = 0; i < FLOWLM_NUM_LAYERS; i++) {
+        if (g_k_cache_dev[i]) cudaFree(g_k_cache_dev[i]);
+        if (g_v_cache_dev[i]) cudaFree(g_v_cache_dev[i]);
+        g_k_cache_dev[i] = NULL;
+        g_v_cache_dev[i] = NULL;
+    }
+    size_t elems = (size_t)max_len * FLOWLM_NUM_HEADS * FLOWLM_HEAD_DIM;
+    size_t bytes = elems * sizeof(float);
+    for (int i = 0; i < FLOWLM_NUM_LAYERS; i++) {
+        if (cudaMalloc((void **)&g_k_cache_dev[i], bytes) != cudaSuccess) {
+            cuda_log_error("cudaMalloc(k_cache)", cudaGetLastError());
+            return -1;
+        }
+        if (cudaMalloc((void **)&g_v_cache_dev[i], bytes) != cudaSuccess) {
+            cuda_log_error("cudaMalloc(v_cache)", cudaGetLastError());
+            return -1;
+        }
+    }
+    g_kv_cache_bytes = bytes;
+    g_kv_cache_max_len = max_len;
+    return 0;
 }
 
 static int ensure_init(void) {
@@ -1599,6 +1684,9 @@ int ptts_cuda_attention_forward(const float *q, const float *k, const float *v,
                                 int T, int H, int D, float *out) {
     if (!q || !k || !v || !out || T <= 0 || H <= 0 || D <= 0) return -1;
     if (ensure_kernels() != 0) return -1;
+    if (cuda_debug_enabled()) {
+        fprintf(stderr, "[ptts] CUDA attention: T=%d H=%d D=%d\n", T, H, D);
+    }
 
     size_t q_bytes = (size_t)T * H * D * sizeof(float);
     size_t out_bytes = (size_t)T * H * D * sizeof(float);
@@ -1624,6 +1712,88 @@ int ptts_cuda_attention_forward(const float *q, const float *k, const float *v,
     }
     if (cuda_check("attn_fused") != 0) return -1;
 
+    if (cudaMemcpy(out, g_attn_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    return 0;
+}
+
+int ptts_cuda_attention_step(const float *q, const float *k, const float *v,
+                             int T, int H, int D, float *out) {
+    if (!q || !k || !v || !out || T <= 0 || H <= 0 || D <= 0) return -1;
+    if (ensure_kernels() != 0) return -1;
+    if (cuda_debug_enabled()) {
+        fprintf(stderr, "[ptts] CUDA attention step: T=%d H=%d D=%d\n", T, H, D);
+    }
+
+    size_t q_bytes = (size_t)H * D * sizeof(float);
+    size_t kv_bytes = (size_t)T * H * D * sizeof(float);
+    size_t out_bytes = q_bytes;
+
+    if (ensure_device_buffer(&g_attn_q, &g_attn_q_bytes, q_bytes) != 0) return -1;
+    if (ensure_device_buffer(&g_attn_k, &g_attn_k_bytes, kv_bytes) != 0) return -1;
+    if (ensure_device_buffer(&g_attn_v, &g_attn_v_bytes, kv_bytes) != 0) return -1;
+    if (ensure_device_buffer(&g_attn_out, &g_attn_out_bytes, out_bytes) != 0) return -1;
+
+    if (cudaMemcpy(g_attn_q, q, q_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(g_attn_k, k, kv_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(g_attn_v, v, kv_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+
+    float scale = 1.0f / sqrtf((float)D);
+    int block = 256;
+    int grid = (H + block - 1) / block;
+    void *args_step[] = {&g_attn_q, &g_attn_k, &g_attn_v, &g_attn_out, &T, &H, &D, &scale};
+    CUresult cuerr = cuLaunchKernel(g_attn_step, grid, 1, 1, block, 1, 1, 0, 0, args_step, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(attn_step)", cuerr);
+        return -1;
+    }
+    if (cuda_check("attn_step") != 0) return -1;
+
+    if (cudaMemcpy(out, g_attn_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    return 0;
+}
+
+int ptts_cuda_kv_init(int max_len) {
+    if (max_len <= 0) return -1;
+    if (ensure_kernels() != 0) return -1;
+    return ensure_kv_cache(max_len);
+}
+
+int ptts_cuda_kv_push(int layer, int pos, const float *k, const float *v) {
+    if (!k || !v || layer < 0 || layer >= FLOWLM_NUM_LAYERS || pos < 0) return -1;
+    if (!g_k_cache_dev[layer] || !g_v_cache_dev[layer]) return -1;
+    size_t stride = (size_t)FLOWLM_NUM_HEADS * FLOWLM_HEAD_DIM;
+    size_t offset = (size_t)pos * stride;
+    size_t bytes = stride * sizeof(float);
+    float *dk = g_k_cache_dev[layer] + offset;
+    float *dv = g_v_cache_dev[layer] + offset;
+    if (cudaMemcpy(dk, k, bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(dv, v, bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    return 0;
+}
+
+int ptts_cuda_attention_step_kv(int layer, int T, int H, int D, const float *q, float *out) {
+    if (!q || !out || T <= 0 || H <= 0 || D <= 0) return -1;
+    if (layer < 0 || layer >= FLOWLM_NUM_LAYERS) return -1;
+    if (!g_k_cache_dev[layer] || !g_v_cache_dev[layer]) return -1;
+    if (ensure_kernels() != 0) return -1;
+
+    size_t q_bytes = (size_t)H * D * sizeof(float);
+    size_t out_bytes = q_bytes;
+    if (ensure_device_buffer(&g_attn_q, &g_attn_q_bytes, q_bytes) != 0) return -1;
+    if (ensure_device_buffer(&g_attn_out, &g_attn_out_bytes, out_bytes) != 0) return -1;
+
+    if (cudaMemcpy(g_attn_q, q, q_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    float scale = 1.0f / sqrtf((float)D);
+    int block = 256;
+    int grid = (H + block - 1) / block;
+    void *args_step[] = {&g_attn_q, &g_k_cache_dev[layer], &g_v_cache_dev[layer], &g_attn_out,
+                         &T, &H, &D, &scale};
+    CUresult cuerr = cuLaunchKernel(g_attn_step, grid, 1, 1, block, 1, 1, 0, 0, args_step, 0);
+    if (cuerr != CUDA_SUCCESS) {
+        cu_log_error("cuLaunchKernel(attn_step_kv)", cuerr);
+        return -1;
+    }
+    if (cuda_check("attn_step_kv") != 0) return -1;
     if (cudaMemcpy(out, g_attn_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
     return 0;
 }
@@ -1707,6 +1877,14 @@ void ptts_cuda_shutdown(void) {
     g_attn_v_bytes = 0;
     g_attn_scores_bytes = 0;
     g_attn_out_bytes = 0;
+    for (int i = 0; i < FLOWLM_NUM_LAYERS; i++) {
+        if (g_k_cache_dev[i]) cudaFree(g_k_cache_dev[i]);
+        if (g_v_cache_dev[i]) cudaFree(g_v_cache_dev[i]);
+        g_k_cache_dev[i] = NULL;
+        g_v_cache_dev[i] = NULL;
+    }
+    g_kv_cache_bytes = 0;
+    g_kv_cache_max_len = 0;
     cublasDestroy(g_handle);
     g_inited = 0;
 }

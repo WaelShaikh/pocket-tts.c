@@ -86,6 +86,12 @@ int ptts_cuda_flownet_forward(const ptts_cuda_flow_net_desc *desc,
 
 int ptts_cuda_attention_forward(const float *q, const float *k, const float *v,
                                 int T, int H, int D, float *out);
+int ptts_cuda_attention_step(const float *q, const float *k, const float *v,
+                             int T, int H, int D, float *out);
+int ptts_cuda_kv_init(int max_len);
+int ptts_cuda_kv_push(int layer, int pos, const float *k, const float *v);
+int ptts_cuda_attention_step_kv(int layer, int T, int H, int D,
+                                const float *q, float *out);
 
 void ptts_cuda_shutdown(void);
 

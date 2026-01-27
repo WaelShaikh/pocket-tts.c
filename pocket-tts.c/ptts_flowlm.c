@@ -4,6 +4,8 @@
 #ifdef PTTS_USE_CUDA
 #include "ptts_cuda.h"
 static int attn_cuda_enabled(void);
+static int attn_kv_cuda_enabled(void);
+static int attn_cuda_cached_enabled(int T);
 #endif
 #include <math.h>
 #include <stdio.h>
@@ -245,8 +247,62 @@ static void rope_apply(float *q, float *k, int T, int H, int D, float max_period
 static void attention_forward(const float *q, const float *k, const float *v,
                               int T, int H, int D, float *out) {
 #ifdef PTTS_USE_CUDA
+#ifdef PTTS_CUDA_VALIDATE
+    const char *vflag = getenv("PTTS_CUDA_VALIDATE");
+    int validate = (vflag && vflag[0] && strcmp(vflag, "0") != 0);
+#else
+    int validate = 0;
+#endif
     if (attn_cuda_enabled()) {
-        if (ptts_cuda_attention_forward(q, k, v, T, H, D, out) == 0) return;
+        if (!validate) {
+            if (ptts_cuda_attention_forward(q, k, v, T, H, D, out) == 0) return;
+        } else {
+            size_t bytes = (size_t)T * H * D * sizeof(float);
+            float *gpu_out = (float *)malloc(bytes);
+            if (gpu_out && ptts_cuda_attention_forward(q, k, v, T, H, D, gpu_out) == 0) {
+                float scale = 1.0f / sqrtf((float)D);
+                int max_keys = T;
+                float *scores = (float *)malloc((size_t)max_keys * sizeof(float));
+                if (scores) {
+                    for (int h = 0; h < H; h++) {
+                        for (int tq = 0; tq < T; tq++) {
+                            int n_keys = tq + 1;
+                            const float *qvec = q + (tq * H + h) * D;
+                            for (int tk = 0; tk < n_keys; tk++) {
+                                const float *kvec = k + (tk * H + h) * D;
+                                float dot = 0.0f;
+                                for (int d = 0; d < D; d++) dot += qvec[d] * kvec[d];
+                                scores[tk] = dot * scale;
+                            }
+                            softmax_inplace(scores, n_keys);
+                            float *outvec = out + (tq * H + h) * D;
+                            for (int d = 0; d < D; d++) outvec[d] = 0.0f;
+                            for (int tk = 0; tk < n_keys; tk++) {
+                                const float *vvec = v + (tk * H + h) * D;
+                                float w = scores[tk];
+                                for (int d = 0; d < D; d++) outvec[d] += w * vvec[d];
+                            }
+                        }
+                    }
+                    float maxd = 0.0f;
+                    int n = T * H * D;
+                    for (int i = 0; i < n; i++) {
+                        float d = out[i] - gpu_out[i];
+                        if (d < 0.0f) d = -d;
+                        if (d > maxd) maxd = d;
+                    }
+                    fprintf(stderr, "[ptts] CUDA validate attn maxdiff=%.6f\n", maxd);
+                    free(scores);
+                } else {
+                    free(gpu_out);
+                    gpu_out = NULL;
+                }
+            }
+            if (gpu_out) {
+                free(gpu_out);
+                return;
+            }
+        }
     }
 #endif
     float scale = 1.0f / sqrtf((float)D);
@@ -340,6 +396,14 @@ static ptts_flowlm_kv_cache *kv_cache_create(int max_len) {
         kv_cache_free(cache);
         return NULL;
     }
+#ifdef PTTS_USE_CUDA
+    if (attn_cuda_enabled() && attn_kv_cuda_enabled()) {
+        if (ptts_cuda_kv_init(max_len) != 0) {
+            kv_cache_free(cache);
+            return NULL;
+        }
+    }
+#endif
     return cache;
 }
 
@@ -388,25 +452,83 @@ static int transformer_forward_step_cached(const ptts_flowlm *fm, ptts_flowlm_kv
         memcpy(cache->k_cache[l] + base, k, (size_t)d * sizeof(float));
         memcpy(cache->v_cache[l] + base, v, (size_t)d * sizeof(float));
 
-        float *scores = cache->scores;
-        for (int hh = 0; hh < h; hh++) {
-            float *out = attn_out + hh * hd;
-            int n_keys = pos + 1;
-            const float *qvec = q + hh * hd;
-            for (int tk = 0; tk < n_keys; tk++) {
-                const float *kvec = cache->k_cache[l] + ((size_t)tk * h + hh) * hd;
-                float dot = 0.0f;
-                for (int d0 = 0; d0 < hd; d0++) dot += qvec[d0] * kvec[d0];
-                scores[tk] = dot / sqrtf((float)hd);
-            }
-            softmax_inplace(scores, n_keys);
-            for (int d0 = 0; d0 < hd; d0++) out[d0] = 0.0f;
-            for (int tk = 0; tk < n_keys; tk++) {
-                const float *vvec = cache->v_cache[l] + ((size_t)tk * h + hh) * hd;
-                float w = scores[tk];
-                for (int d0 = 0; d0 < hd; d0++) out[d0] += w * vvec[d0];
+        int use_gpu = 0;
+#ifdef PTTS_USE_CUDA
+#ifdef PTTS_CUDA_VALIDATE
+        const char *vflag = getenv("PTTS_CUDA_VALIDATE");
+        int validate = (vflag && vflag[0] && strcmp(vflag, "0") != 0);
+#else
+        int validate = 0;
+#endif
+        if (attn_cuda_enabled() && attn_kv_cuda_enabled()) {
+            if (ptts_cuda_kv_push(l, pos, k, v) != 0) {
+                /* keep CPU path if GPU cache update fails */
             }
         }
+        if (attn_cuda_cached_enabled(pos + 1) && !validate) {
+            if (attn_kv_cuda_enabled()) {
+                if (ptts_cuda_attention_step_kv(l, pos + 1, h, hd, q, attn_out) == 0) {
+                    use_gpu = 1;
+                }
+            } else {
+                if (ptts_cuda_attention_step(q, cache->k_cache[l], cache->v_cache[l],
+                                             pos + 1, h, hd, attn_out) == 0) {
+                    use_gpu = 1;
+                }
+            }
+        }
+#else
+        int validate = 0;
+#endif
+
+        if (!use_gpu) {
+            float *scores = cache->scores;
+            for (int hh = 0; hh < h; hh++) {
+                float *out = attn_out + hh * hd;
+                int n_keys = pos + 1;
+                const float *qvec = q + hh * hd;
+                for (int tk = 0; tk < n_keys; tk++) {
+                    const float *kvec = cache->k_cache[l] + ((size_t)tk * h + hh) * hd;
+                    float dot = 0.0f;
+                    for (int d0 = 0; d0 < hd; d0++) dot += qvec[d0] * kvec[d0];
+                    scores[tk] = dot / sqrtf((float)hd);
+                }
+                softmax_inplace(scores, n_keys);
+                for (int d0 = 0; d0 < hd; d0++) out[d0] = 0.0f;
+                for (int tk = 0; tk < n_keys; tk++) {
+                    const float *vvec = cache->v_cache[l] + ((size_t)tk * h + hh) * hd;
+                    float w = scores[tk];
+                    for (int d0 = 0; d0 < hd; d0++) out[d0] += w * vvec[d0];
+                }
+            }
+        }
+
+#ifdef PTTS_USE_CUDA
+        if (validate && attn_cuda_cached_enabled(pos + 1)) {
+            float attn_gpu[FLOWLM_D_MODEL];
+            int ok = 0;
+            if (attn_kv_cuda_enabled()) {
+                if (ptts_cuda_kv_push(l, pos, k, v) == 0 &&
+                    ptts_cuda_attention_step_kv(l, pos + 1, h, hd, q, attn_gpu) == 0) {
+                    ok = 1;
+                }
+            } else {
+                if (ptts_cuda_attention_step(q, cache->k_cache[l], cache->v_cache[l],
+                                             pos + 1, h, hd, attn_gpu) == 0) {
+                    ok = 1;
+                }
+            }
+            if (ok) {
+                float maxd = 0.0f;
+                for (int i = 0; i < d; i++) {
+                    float diff = attn_out[i] - attn_gpu[i];
+                    if (diff < 0.0f) diff = -diff;
+                    if (diff > maxd) maxd = diff;
+                }
+                fprintf(stderr, "[ptts] CUDA validate attn_step maxdiff=%.6f\n", maxd);
+            }
+        }
+#endif
 
         linear_forward(layer->out_proj_w, NULL, d, d, attn_out, 1, x_norm);
         for (int i = 0; i < d; i++) x[i] += x_norm[i];
@@ -463,6 +585,31 @@ static int attn_cuda_enabled(void) {
         inited = 1;
     }
     return enabled;
+}
+
+static int attn_kv_cuda_enabled(void) {
+    static int inited = 0;
+    static int enabled = 1;
+    if (!inited) {
+        const char *v = getenv("PTTS_CUDA_KV");
+        enabled = !(v && v[0] && strcmp(v, "0") == 0);
+        inited = 1;
+    }
+    return enabled;
+}
+
+static int attn_cuda_cached_enabled(int T) {
+    static int inited = 0;
+    static int min_t = 128;
+    if (!inited) {
+        const char *v = getenv("PTTS_CUDA_ATTN_MIN_T");
+        if (v && v[0]) {
+            int tmp = atoi(v);
+            if (tmp >= 0) min_t = tmp;
+        }
+        inited = 1;
+    }
+    return attn_cuda_enabled() && T >= min_t;
 }
 #endif
 
