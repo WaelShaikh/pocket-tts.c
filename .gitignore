@@ -4,3 +4,5 @@ supertonic
 pocket-tts
 ptts
 pocket-tts-model/
+supertonic-model/
+onnxruntime-linux-x64-*/
