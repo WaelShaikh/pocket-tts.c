@@ -20,6 +20,14 @@ static void write_u32_le(FILE *f, uint32_t v) {
     fwrite(b, 1, 4, f);
 }
 
+static uint16_t read_u16_le(const uint8_t *b) {
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+
+static uint32_t read_u32_le(const uint8_t *b) {
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
 ptts_audio *ptts_audio_create(int sample_rate, int channels, int num_samples) {
     if (sample_rate <= 0 || channels <= 0 || num_samples < 0) return NULL;
 
@@ -89,4 +97,76 @@ int ptts_audio_save_wav(const ptts_audio *audio, const char *path) {
 
     fclose(f);
     return 0;
+}
+
+ptts_audio *ptts_audio_load_wav(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    uint8_t buf[12];
+    if (fread(buf, 1, 12, f) != 12) { fclose(f); return NULL; }
+    if (memcmp(buf, "RIFF", 4) != 0 || memcmp(buf + 8, "WAVE", 4) != 0) {
+        fclose(f); return NULL;
+    }
+
+    /* Seek chunks */
+    int channels = 0, sample_rate = 0, bits = 0;
+    int data_found = 0;
+    size_t data_len = 0;
+
+    while (fread(buf, 1, 8, f) == 8) {
+        uint32_t len = read_u32_le(buf + 4);
+        if (memcmp(buf, "fmt ", 4) == 0) {
+            uint8_t *fmt = malloc(len);
+            if (fread(fmt, 1, len, f) != len) { free(fmt); fclose(f); return NULL; }
+            uint16_t format = read_u16_le(fmt);
+            channels = read_u16_le(fmt + 2);
+            sample_rate = read_u32_le(fmt + 4);
+            bits = read_u16_le(fmt + 14);
+            free(fmt);
+            if (format != 1 && format != 3) { /* PCM or IEEE Float */
+                fclose(f); return NULL;
+            }
+        } else if (memcmp(buf, "data", 4) == 0) {
+            data_found = 1;
+            data_len = len;
+            break; /* Assume data is last relevant chunk or we process it now */
+        } else {
+            fseek(f, len, SEEK_CUR);
+        }
+    }
+
+    if (!data_found || channels == 0 || sample_rate == 0 || bits == 0) {
+        fclose(f); return NULL;
+    }
+
+    int bytes_per_sample = bits / 8;
+    int num_samples = data_len / (channels * bytes_per_sample);
+    ptts_audio *audio = ptts_audio_create(sample_rate, channels, num_samples);
+    if (!audio) { fclose(f); return NULL; }
+
+    uint8_t *raw = malloc(data_len);
+    if (fread(raw, 1, data_len, f) != data_len) {
+        free(raw); ptts_audio_free(audio); fclose(f); return NULL;
+    }
+    fclose(f);
+
+    float *out = audio->samples;
+    if (bits == 16) {
+        for (size_t i = 0; i < (size_t)num_samples * channels; i++) {
+            int16_t v = (int16_t)read_u16_le(raw + i * 2);
+            out[i] = (float)v / 32768.0f;
+        }
+    } else if (bits == 32) {
+        /* Assume float if format==3, but some wavs use int32. Assuming int32 for PCM compatibility unless we parsed format strictly.
+           Actually standard PCM wavs are usually 16 or 8. Let's assume standard int16.
+           If bits is 32, it could be float. We won't support complex formats here for now. */
+        // Simplified: support 16-bit only for now as it's standard
+        free(raw); ptts_audio_free(audio); return NULL;
+    } else {
+        free(raw); ptts_audio_free(audio); return NULL;
+    }
+
+    free(raw);
+    return audio;
 }

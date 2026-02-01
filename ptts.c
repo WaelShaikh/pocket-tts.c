@@ -364,6 +364,121 @@ int ptts_load_voice_conditioning(ptts_ctx *ctx, const char *voice_path,
 }
 
 /* ========================================================================
+ * Voice Export
+ * ======================================================================== */
+
+/* Minimal writer for a single tensor .safetensors file */
+static int write_single_tensor_safetensors(const char *path, const char *tensor_name,
+                                           const float *data, int frames, int dim) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+
+    size_t data_len = (size_t)frames * dim * sizeof(float);
+    /* Header JSON */
+    char header_json[1024];
+    /* audio_prompt: { dtype: F32, shape: [1, frames, dim], data_offsets: [0, len] } */
+    int n = snprintf(header_json, sizeof(header_json),
+        "{\"%s\":{\"dtype\":\"F32\",\"shape\":[1,%d,%d],\"data_offsets\":[0,%zu]},"
+        "\"__metadata__\":{\"format\":\"ptts-c\"}}",
+        tensor_name, frames, dim, data_len);
+
+    /* Padding to 8 bytes */
+    size_t header_len = (size_t)n;
+    size_t padded_len = (header_len + 7) & ~7;
+    size_t pad = padded_len - header_len;
+
+    /* Write 64-bit length of header */
+    uint64_t hdr_sz = (uint64_t)padded_len;
+    fwrite(&hdr_sz, 1, 8, f);
+
+    /* Write JSON */
+    fwrite(header_json, 1, header_len, f);
+    for (size_t i = 0; i < pad; i++) fputc(' ', f);
+
+    /* Write data */
+    fwrite(data, 1, data_len, f);
+
+    fclose(f);
+    return 0;
+}
+
+int ptts_export_voice(ptts_ctx *ctx, const char *wav_path, const char *out_path) {
+    if (!ctx || !wav_path || !out_path) return -1;
+
+    ptts_audio *audio = ptts_audio_load_wav(wav_path);
+    if (!audio) {
+        set_error("Failed to load WAV file");
+        return -1;
+    }
+
+    /* Check sample rate compatibility - ideally should resample, but we error out for now if mismatch */
+    /* PocketTTS usually expects 24000Hz */
+    if (audio->sample_rate != PTTS_DEFAULT_SAMPLE_RATE) {
+        /* TODO: Simple resampling or warn */
+        fprintf(stderr, "Warning: Input WAV sample rate is %d, expected %d. Results may be poor.\n",
+                audio->sample_rate, PTTS_DEFAULT_SAMPLE_RATE);
+    }
+
+    /* Load FlowLM (for speaker proj) and Mimi (for encoder) */
+    ptts_flowlm *fm = ptts_flowlm_load(ctx);
+    if (!fm) {
+        ptts_audio_free(audio);
+        set_error("Failed to load FlowLM weights for projection");
+        return -1;
+    }
+    ptts_mimi *mm = ptts_mimi_load(ctx);
+    if (!mm) {
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Failed to load Mimi weights");
+        return -1;
+    }
+
+    float *latents_512 = NULL;
+    int frames = 0;
+
+    /* Encode: WAV -> 512-dim latents */
+    if (ptts_mimi_encode(mm, audio->samples, audio->num_samples, &latents_512, &frames) != 0) {
+        ptts_mimi_free(mm);
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Mimi encoding failed");
+        return -1;
+    }
+
+    /* Project: 512-dim -> 1024-dim */
+    float *embed_1024 = (float *)malloc((size_t)frames * 1024 * sizeof(float));
+    if (!embed_1024) {
+        free(latents_512);
+        ptts_mimi_free(mm);
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Out of memory");
+        return -1;
+    }
+
+    ptts_flowlm_project_speaker(fm, latents_512, frames, embed_1024);
+
+    /* Save to .safetensors */
+    if (write_single_tensor_safetensors(out_path, "audio_prompt", embed_1024, frames, 1024) != 0) {
+        free(embed_1024);
+        free(latents_512);
+        ptts_mimi_free(mm);
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Failed to write output file");
+        return -1;
+    }
+
+    free(embed_1024);
+    free(latents_512);
+    ptts_mimi_free(mm);
+    ptts_flowlm_free(fm);
+    ptts_audio_free(audio);
+    return 0;
+}
+
+/* ========================================================================
  * Core API
  * ======================================================================== */
 
@@ -1158,6 +1273,121 @@ ptts_audio *ptts_generate(ptts_ctx *ctx, const char *text,
     ptts_flowlm_free(fm);
     free(ids);
     return audio;
+}
+
+/* ========================================================================
+ * Voice Export
+ * ======================================================================== */
+
+/* Minimal writer for a single tensor .safetensors file */
+static int write_single_tensor_safetensors(const char *path, const char *tensor_name,
+                                           const float *data, int frames, int dim) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+
+    size_t data_len = (size_t)frames * dim * sizeof(float);
+    /* Header JSON */
+    char header_json[1024];
+    /* audio_prompt: { dtype: F32, shape: [1, frames, dim], data_offsets: [0, len] } */
+    int n = snprintf(header_json, sizeof(header_json),
+        "{\"%s\":{\"dtype\":\"F32\",\"shape\":[1,%d,%d],\"data_offsets\":[0,%zu]},"
+        "\"__metadata__\":{\"format\":\"ptts-c\"}}",
+        tensor_name, frames, dim, data_len);
+
+    /* Padding to 8 bytes */
+    size_t header_len = (size_t)n;
+    size_t padded_len = (header_len + 7) & ~7;
+    size_t pad = padded_len - header_len;
+
+    /* Write 64-bit length of header */
+    uint64_t hdr_sz = (uint64_t)padded_len;
+    fwrite(&hdr_sz, 1, 8, f);
+
+    /* Write JSON */
+    fwrite(header_json, 1, header_len, f);
+    for (size_t i = 0; i < pad; i++) fputc(' ', f);
+
+    /* Write data */
+    fwrite(data, 1, data_len, f);
+
+    fclose(f);
+    return 0;
+}
+
+int ptts_export_voice(ptts_ctx *ctx, const char *wav_path, const char *out_path) {
+    if (!ctx || !wav_path || !out_path) return -1;
+
+    ptts_audio *audio = ptts_audio_load_wav(wav_path);
+    if (!audio) {
+        set_error("Failed to load WAV file");
+        return -1;
+    }
+
+    /* Check sample rate compatibility - ideally should resample, but we error out for now if mismatch */
+    /* PocketTTS usually expects 24000Hz */
+    if (audio->sample_rate != PTTS_DEFAULT_SAMPLE_RATE) {
+        /* TODO: Simple resampling or warn */
+        fprintf(stderr, "Warning: Input WAV sample rate is %d, expected %d. Results may be poor.\n",
+                audio->sample_rate, PTTS_DEFAULT_SAMPLE_RATE);
+    }
+
+    /* Load FlowLM (for speaker proj) and Mimi (for encoder) */
+    ptts_flowlm *fm = ptts_flowlm_load(ctx);
+    if (!fm) {
+        ptts_audio_free(audio);
+        set_error("Failed to load FlowLM weights for projection");
+        return -1;
+    }
+    ptts_mimi *mm = ptts_mimi_load(ctx);
+    if (!mm) {
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Failed to load Mimi weights");
+        return -1;
+    }
+
+    float *latents_512 = NULL;
+    int frames = 0;
+
+    /* Encode: WAV -> 512-dim latents */
+    if (ptts_mimi_encode(mm, audio->samples, audio->num_samples, &latents_512, &frames) != 0) {
+        ptts_mimi_free(mm);
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Mimi encoding failed");
+        return -1;
+    }
+
+    /* Project: 512-dim -> 1024-dim */
+    float *embed_1024 = (float *)malloc((size_t)frames * 1024 * sizeof(float));
+    if (!embed_1024) {
+        free(latents_512);
+        ptts_mimi_free(mm);
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Out of memory");
+        return -1;
+    }
+
+    ptts_flowlm_project_speaker(fm, latents_512, frames, embed_1024);
+
+    /* Save to .safetensors */
+    if (write_single_tensor_safetensors(out_path, "audio_prompt", embed_1024, frames, 1024) != 0) {
+        free(embed_1024);
+        free(latents_512);
+        ptts_mimi_free(mm);
+        ptts_flowlm_free(fm);
+        ptts_audio_free(audio);
+        set_error("Failed to write output file");
+        return -1;
+    }
+
+    free(embed_1024);
+    free(latents_512);
+    ptts_mimi_free(mm);
+    ptts_flowlm_free(fm);
+    ptts_audio_free(audio);
+    return 0;
 }
 
 /* ========================================================================

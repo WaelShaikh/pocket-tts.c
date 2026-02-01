@@ -20,6 +20,9 @@ void ptts_audio_free(ptts_audio *audio);
 /* Save audio as 16-bit PCM WAV. Returns 0 on success, -1 on error. */
 int ptts_audio_save_wav(const ptts_audio *audio, const char *path);
 
+/* Load audio from 16-bit PCM WAV. Returns NULL on error. */
+ptts_audio *ptts_audio_load_wav(const char *path);
+
 #ifdef __cplusplus
 }
 #endif

@@ -59,12 +59,21 @@ typedef struct {
 struct ptts_mimi {
     ptts_ctx *ctx;
     float *quant_w; /* [512, 32, 1] */
+
+    /* Decoder components */
     ptts_convtr1d upsample;
     ptts_conv1d dec_in;
     ptts_convtr1d up[3];
     ptts_resblock res[3];
     ptts_conv1d dec_out;
     ptts_mimi_layer layers[MIMI_NUM_LAYERS];
+
+    /* Encoder components */
+    ptts_conv1d enc_in;
+    ptts_resblock enc_res[3];
+    ptts_conv1d enc_down[3];
+    ptts_conv1d enc_out;
+    ptts_mimi_layer enc_layers[MIMI_NUM_LAYERS];
 };
 
 static int ends_with(const char *s, const char *suffix) {
@@ -294,7 +303,7 @@ static void attention_forward_context(const float *q, const float *k, const floa
     free(scores);
 }
 
-static int transformer_forward(const ptts_mimi *mm, float *x, int T) {
+static int transformer_forward(const ptts_mimi_layer *layers, float *x, int T) {
     int d = MIMI_D_MODEL;
     int h = MIMI_NUM_HEADS;
     int hd = MIMI_HEAD_DIM;
@@ -317,7 +326,7 @@ static int transformer_forward(const ptts_mimi *mm, float *x, int T) {
     }
 
     for (int l = 0; l < MIMI_NUM_LAYERS; l++) {
-        const ptts_mimi_layer *layer = &mm->layers[l];
+        const ptts_mimi_layer *layer = &layers[l];
 
         layernorm_forward(x, T, d, layer->norm1_w, layer->norm1_b, 1e-5f, x_norm);
         linear_forward(layer->in_proj_w, NULL, 3 * d, d, x_norm, T, qkv);
@@ -505,6 +514,125 @@ ptts_mimi *ptts_mimi_load(ptts_ctx *ctx) {
         mm->layers[i].ls2 = load_f32(ctx, name);
     }
 
+    /* Encoder loads */
+    mm->enc_in.w = load_f32(ctx, "encoder.model.0.conv.weight");
+    mm->enc_in.b = load_f32(ctx, "encoder.model.0.conv.bias");
+    mm->enc_in.in_ch = 1;
+    mm->enc_in.out_ch = 64;
+    mm->enc_in.k = 7;
+    mm->enc_in.stride = 1;
+    mm->enc_in.groups = 1;
+
+    /* Stage 0: ratio 6 */
+    mm->enc_res[0].dim = 64;
+    mm->enc_res[0].compress = 2;
+    mm->enc_res[0].conv1.w = load_f32(ctx, "encoder.model.1.block.1.conv.weight");
+    mm->enc_res[0].conv1.b = load_f32(ctx, "encoder.model.1.block.1.conv.bias");
+    mm->enc_res[0].conv1.in_ch = 64;
+    mm->enc_res[0].conv1.out_ch = 32;
+    mm->enc_res[0].conv1.k = 3;
+    mm->enc_res[0].conv1.stride = 1;
+    mm->enc_res[0].conv1.groups = 1;
+    mm->enc_res[0].conv2.w = load_f32(ctx, "encoder.model.1.block.3.conv.weight");
+    mm->enc_res[0].conv2.b = load_f32(ctx, "encoder.model.1.block.3.conv.bias");
+    mm->enc_res[0].conv2.in_ch = 32;
+    mm->enc_res[0].conv2.out_ch = 64;
+    mm->enc_res[0].conv2.k = 1;
+    mm->enc_res[0].conv2.stride = 1;
+    mm->enc_res[0].conv2.groups = 1;
+
+    mm->enc_down[0].w = load_f32(ctx, "encoder.model.3.conv.weight");
+    mm->enc_down[0].b = load_f32(ctx, "encoder.model.3.conv.bias");
+    mm->enc_down[0].in_ch = 64;
+    mm->enc_down[0].out_ch = 128;
+    mm->enc_down[0].k = 12; // 2 * ratio (6)
+    mm->enc_down[0].stride = 6;
+    mm->enc_down[0].groups = 1;
+
+    /* Stage 1: ratio 5 */
+    mm->enc_res[1].dim = 128;
+    mm->enc_res[1].compress = 2;
+    mm->enc_res[1].conv1.w = load_f32(ctx, "encoder.model.4.block.1.conv.weight");
+    mm->enc_res[1].conv1.b = load_f32(ctx, "encoder.model.4.block.1.conv.bias");
+    mm->enc_res[1].conv1.in_ch = 128;
+    mm->enc_res[1].conv1.out_ch = 64;
+    mm->enc_res[1].conv1.k = 3;
+    mm->enc_res[1].conv1.stride = 1;
+    mm->enc_res[1].conv1.groups = 1;
+    mm->enc_res[1].conv2.w = load_f32(ctx, "encoder.model.4.block.3.conv.weight");
+    mm->enc_res[1].conv2.b = load_f32(ctx, "encoder.model.4.block.3.conv.bias");
+    mm->enc_res[1].conv2.in_ch = 64;
+    mm->enc_res[1].conv2.out_ch = 128;
+    mm->enc_res[1].conv2.k = 1;
+    mm->enc_res[1].conv2.stride = 1;
+    mm->enc_res[1].conv2.groups = 1;
+
+    mm->enc_down[1].w = load_f32(ctx, "encoder.model.6.conv.weight");
+    mm->enc_down[1].b = load_f32(ctx, "encoder.model.6.conv.bias");
+    mm->enc_down[1].in_ch = 128;
+    mm->enc_down[1].out_ch = 256;
+    mm->enc_down[1].k = 10; // 2 * ratio (5)
+    mm->enc_down[1].stride = 5;
+    mm->enc_down[1].groups = 1;
+
+    /* Stage 2: ratio 4 */
+    mm->enc_res[2].dim = 256;
+    mm->enc_res[2].compress = 2;
+    mm->enc_res[2].conv1.w = load_f32(ctx, "encoder.model.7.block.1.conv.weight");
+    mm->enc_res[2].conv1.b = load_f32(ctx, "encoder.model.7.block.1.conv.bias");
+    mm->enc_res[2].conv1.in_ch = 256;
+    mm->enc_res[2].conv1.out_ch = 128;
+    mm->enc_res[2].conv1.k = 3;
+    mm->enc_res[2].conv1.stride = 1;
+    mm->enc_res[2].conv1.groups = 1;
+    mm->enc_res[2].conv2.w = load_f32(ctx, "encoder.model.7.block.3.conv.weight");
+    mm->enc_res[2].conv2.b = load_f32(ctx, "encoder.model.7.block.3.conv.bias");
+    mm->enc_res[2].conv2.in_ch = 128;
+    mm->enc_res[2].conv2.out_ch = 256;
+    mm->enc_res[2].conv2.k = 1;
+    mm->enc_res[2].conv2.stride = 1;
+    mm->enc_res[2].conv2.groups = 1;
+
+    mm->enc_down[2].w = load_f32(ctx, "encoder.model.9.conv.weight");
+    mm->enc_down[2].b = load_f32(ctx, "encoder.model.9.conv.bias");
+    mm->enc_down[2].in_ch = 256;
+    mm->enc_down[2].out_ch = 512;
+    mm->enc_down[2].k = 8; // 2 * ratio (4)
+    mm->enc_down[2].stride = 4;
+    mm->enc_down[2].groups = 1;
+
+    mm->enc_out.w = load_f32(ctx, "encoder.model.11.conv.weight");
+    mm->enc_out.b = load_f32(ctx, "encoder.model.11.conv.bias");
+    mm->enc_out.in_ch = 512;
+    mm->enc_out.out_ch = 512;
+    mm->enc_out.k = 3;
+    mm->enc_out.stride = 1;
+    mm->enc_out.groups = 1;
+
+    for (int i = 0; i < MIMI_NUM_LAYERS; i++) {
+        char name[160];
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.self_attn.in_proj.weight", i);
+        mm->enc_layers[i].in_proj_w = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.self_attn.out_proj.weight", i);
+        mm->enc_layers[i].out_proj_w = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.norm1.weight", i);
+        mm->enc_layers[i].norm1_w = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.norm1.bias", i);
+        mm->enc_layers[i].norm1_b = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.norm2.weight", i);
+        mm->enc_layers[i].norm2_w = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.norm2.bias", i);
+        mm->enc_layers[i].norm2_b = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.linear1.weight", i);
+        mm->enc_layers[i].linear1_w = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.linear2.weight", i);
+        mm->enc_layers[i].linear2_w = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.layer_scale_1.scale", i);
+        mm->enc_layers[i].ls1 = load_f32(ctx, name);
+        snprintf(name, sizeof(name), "encoder_transformer.transformer.layers.%d.layer_scale_2.scale", i);
+        mm->enc_layers[i].ls2 = load_f32(ctx, name);
+    }
+
     if (!mm->quant_w || !mm->layers[0].in_proj_w || !mm->dec_out.w || !mm->upsample.w) {
         ptts_mimi_free(mm);
         return NULL;
@@ -515,6 +643,7 @@ ptts_mimi *ptts_mimi_load(ptts_ctx *ctx) {
 void ptts_mimi_free(ptts_mimi *mm) {
     if (!mm) return;
     free_ptr(&mm->quant_w);
+    /* Decoder */
     free_ptr(&mm->upsample.w);
     free_ptr(&mm->dec_in.w);
     free_ptr(&mm->dec_in.b);
@@ -540,6 +669,33 @@ void ptts_mimi_free(ptts_mimi *mm) {
         free_ptr(&mm->layers[i].ls1);
         free_ptr(&mm->layers[i].ls2);
     }
+
+    /* Encoder */
+    free_ptr(&mm->enc_in.w);
+    free_ptr(&mm->enc_in.b);
+    for (int i = 0; i < 3; i++) {
+        free_ptr(&mm->enc_res[i].conv1.w);
+        free_ptr(&mm->enc_res[i].conv1.b);
+        free_ptr(&mm->enc_res[i].conv2.w);
+        free_ptr(&mm->enc_res[i].conv2.b);
+        free_ptr(&mm->enc_down[i].w);
+        free_ptr(&mm->enc_down[i].b);
+    }
+    free_ptr(&mm->enc_out.w);
+    free_ptr(&mm->enc_out.b);
+    for (int i = 0; i < MIMI_NUM_LAYERS; i++) {
+        free_ptr(&mm->enc_layers[i].in_proj_w);
+        free_ptr(&mm->enc_layers[i].out_proj_w);
+        free_ptr(&mm->enc_layers[i].norm1_w);
+        free_ptr(&mm->enc_layers[i].norm1_b);
+        free_ptr(&mm->enc_layers[i].norm2_w);
+        free_ptr(&mm->enc_layers[i].norm2_b);
+        free_ptr(&mm->enc_layers[i].linear1_w);
+        free_ptr(&mm->enc_layers[i].linear2_w);
+        free_ptr(&mm->enc_layers[i].ls1);
+        free_ptr(&mm->enc_layers[i].ls2);
+    }
+
     free(mm);
 }
 
@@ -554,7 +710,7 @@ int ptts_mimi_forward_one(ptts_mimi *mm, const float *latent, float *out_embed) 
         x[o] = sum;
     }
 
-    if (transformer_forward(mm, x, 1) != 0) return -1;
+    if (transformer_forward(mm->layers, x, 1) != 0) return -1;
     memcpy(out_embed, x, sizeof(x));
     return 0;
 }
@@ -593,7 +749,7 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
     if (!up_t) { free(up); return -1; }
     chw_to_thw(up, MIMI_D_MODEL, up_len, up_t);
 
-    if (transformer_forward(mm, up_t, up_len) != 0) {
+    if (transformer_forward(mm->layers, up_t, up_len) != 0) {
         free(up_t);
         free(up);
         return -1;
@@ -730,5 +886,57 @@ int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
     memcpy(out_audio, out, (size_t)T * sizeof(float));
     *out_len = T;
     free(out);
+    return 0;
+}
+
+int ptts_mimi_encode(ptts_mimi *mm, const float *audio, int num_samples,
+                     float **out_latents, int *out_frames) {
+    if (!mm || !audio || num_samples <= 0 || !out_latents || !out_frames) return -1;
+
+    /* Conv stack */
+    float *x = (float *)malloc(sizeof(float) * num_samples);
+    memcpy(x, audio, sizeof(float) * num_samples);
+    int T = num_samples;
+
+    /* Initial conv */
+    int t0 = T / mm->enc_in.stride;
+    float *tmp = (float *)malloc(sizeof(float) * mm->enc_in.out_ch * t0);
+    if (!tmp) { free(x); return -1; }
+    conv1d_forward_stream(&mm->enc_in, x, T, tmp);
+    free(x); x = tmp; T = t0;
+
+    /* 3 Stages */
+    for (int i = 0; i < 3; i++) {
+        resblock_forward(&mm->enc_res[i], x, T);
+        elu_inplace(x, mm->enc_res[i].dim * T);
+
+        int t_next = T / mm->enc_down[i].stride;
+        float *next = (float *)malloc(sizeof(float) * mm->enc_down[i].out_ch * t_next);
+        if (!next) { free(x); return -1; }
+        conv1d_forward_stream(&mm->enc_down[i], x, T, next);
+        free(x); x = next; T = t_next;
+    }
+
+    /* Final conv */
+    elu_inplace(x, mm->enc_out.in_ch * T);
+    float *out = (float *)malloc(sizeof(float) * mm->enc_out.out_ch * T);
+    if (!out) { free(x); return -1; }
+    conv1d_forward_stream(&mm->enc_out, x, T, out);
+    free(x); x = out;
+
+    /* Transformer */
+    /* x is [512, T] (channel-major), transformer expects time-major [T, 512] */
+    float *x_t = (float *)malloc(sizeof(float) * T * MIMI_D_MODEL);
+    chw_to_thw(x, MIMI_D_MODEL, T, x_t);
+    free(x);
+
+    if (transformer_forward(mm->enc_layers, x_t, T) != 0) {
+        free(x_t);
+        return -1;
+    }
+
+    /* Return [T, 512] latents */
+    *out_latents = x_t;
+    *out_frames = T;
     return 0;
 }

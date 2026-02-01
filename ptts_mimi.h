@@ -26,6 +26,15 @@ int ptts_mimi_decode_one(ptts_mimi *mm, const float *latent, float *out_audio, i
 int ptts_mimi_decode(ptts_mimi *mm, const float *latents, int frames,
                      float *out_audio, int *out_len);
 
+/* Encode raw audio into latents (512-dim continuous, unquantized).
+ * audio: mono float array (24kHz assumed)
+ * num_samples: length of audio
+ * out_latents: pointer to receive malloc'd buffer of shape [frames, 512]
+ * out_frames: receives number of frames
+ */
+int ptts_mimi_encode(ptts_mimi *mm, const float *audio, int num_samples,
+                     float **out_latents, int *out_frames);
+
 #ifdef __cplusplus
 }
 #endif

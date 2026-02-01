@@ -1214,3 +1214,11 @@ void ptts_flowlm_scale_latents(const ptts_flowlm *fm, const float *in_latents,
         }
     }
 }
+
+void ptts_flowlm_project_speaker(const ptts_flowlm *fm, const float *in_512, int frames, float *out_1024) {
+    if (!fm || !in_512 || !out_1024 || frames <= 0) return;
+    /* speaker_proj is [1024, 512]. y = x @ W^T.
+     * x is [frames, 512]. W is [1024, 512].
+     */
+    linear_forward(fm->speaker_proj, NULL, 1024, 512, in_512, frames, out_1024);
+}

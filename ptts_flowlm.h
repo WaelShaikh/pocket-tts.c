@@ -51,6 +51,9 @@ int ptts_flowlm_generate_latents(ptts_flowlm *fm, const int *tokens, int token_l
 void ptts_flowlm_scale_latents(const ptts_flowlm *fm, const float *in_latents,
                                int frames, float *out_latents);
 
+/* Project Mimi encoder output (512-dim) to FlowLM conditioning space (1024-dim). */
+void ptts_flowlm_project_speaker(const ptts_flowlm *fm, const float *in_512, int frames, float *out_1024);
+
 #ifdef __cplusplus
 }
 #endif

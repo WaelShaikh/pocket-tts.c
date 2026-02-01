@@ -75,6 +75,13 @@ int ptts_load_voice_conditioning(ptts_ctx *ctx, const char *voice_path,
 ptts_audio *ptts_generate(ptts_ctx *ctx, const char *text,
                           const char *voice_path, const ptts_params *params);
 
+/* Export voice embedding (audio_prompt) from a WAV file.
+ * wav_path: input WAV file
+ * out_path: output .safetensors file path
+ * Returns 0 on success.
+ */
+int ptts_export_voice(ptts_ctx *ctx, const char *wav_path, const char *out_path);
+
 /* Placeholder generator for pipeline testing */
 ptts_audio *ptts_generate_dummy(const char *text, const ptts_params *params);
 
