@@ -1,5 +1,6 @@
 *.o
-flux2.c
+*.a
+supertonic
 pocket-tts
 ptts
 pocket-tts-model/

@@ -1,5 +1,5 @@
 /*
- * ptts_safetensors.h - Safetensors file format reader
+ * st_safetensors.h - Safetensors file format reader
  *
  * Safetensors format:
  *   - 8 bytes: uint64 little-endian header size
@@ -7,8 +7,8 @@
  *   - Remaining: raw tensor data
  */
 
-#ifndef PTTS_SAFETENSORS_H
-#define PTTS_SAFETENSORS_H
+#ifndef ST_SAFETENSORS_H
+#define ST_SAFETENSORS_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -84,4 +84,4 @@ void safetensor_print(const safetensor_t *t);
 /* Print all tensors in file */
 void safetensors_print_all(const safetensors_file_t *sf);
 
-#endif /* PTTS_SAFETENSORS_H */
+#endif /* ST_SAFETENSORS_H */

@@ -1,8 +1,8 @@
 /*
- * ptts_safetensors.c - Safetensors file format reader implementation
+ * st_safetensors.c - Safetensors file format reader implementation
  */
 
-#include "ptts_safetensors.h"
+#include "st_safetensors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

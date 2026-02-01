@@ -6,22 +6,22 @@
  * uses SentencePiece precompiled charsmap when available.
  */
 
-#include "ptts_spm.h"
+#include "st_spm.h"
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-struct ptts_spm_piece {
+struct st_spm_piece {
     char *bytes;
     int len;
     float score;
     int type;
 };
 
-struct ptts_spm {
-    struct ptts_spm_piece *pieces;
+struct st_spm {
+    struct st_spm_piece *pieces;
     int num_pieces;
     int cap_pieces;
     int unk_id;
@@ -93,7 +93,7 @@ static float read_fixed32_as_float(const uint8_t *p) {
     return f;
 }
 
-static int parse_sentence_piece(const uint8_t *buf, size_t len, struct ptts_spm_piece *out) {
+static int parse_sentence_piece(const uint8_t *buf, size_t len, struct st_spm_piece *out) {
     const uint8_t *p = buf;
     const uint8_t *end = buf + len;
 
@@ -153,14 +153,14 @@ static int parse_sentence_piece(const uint8_t *buf, size_t len, struct ptts_spm_
     return 0;
 }
 
-static void spm_set_defaults(ptts_spm *spm) {
+static void spm_set_defaults(st_spm *spm) {
     spm->add_dummy_prefix = 1;
     spm->remove_extra_whitespaces = 1;
     spm->escape_whitespaces = 1;
     spm->treat_whitespace_as_suffix = 0;
 }
 
-static int parse_normalizer_spec(const uint8_t *buf, size_t len, ptts_spm *spm) {
+static int parse_normalizer_spec(const uint8_t *buf, size_t len, st_spm *spm) {
     const uint8_t *p = buf;
     const uint8_t *end = buf + len;
     while (p < end) {
@@ -198,7 +198,7 @@ static int parse_normalizer_spec(const uint8_t *buf, size_t len, ptts_spm *spm) 
     return 0;
 }
 
-static int parse_trainer_spec(const uint8_t *buf, size_t len, ptts_spm *spm) {
+static int parse_trainer_spec(const uint8_t *buf, size_t len, st_spm *spm) {
     const uint8_t *p = buf;
     const uint8_t *end = buf + len;
     while (p < end) {
@@ -242,7 +242,7 @@ static int boundary_index_for_offset(const int *pos, int n, int offset) {
  * Normalization (SentencePiece)
  * ======================================================================== */
 
-static void spm_add_user_piece(ptts_spm *spm, const char *piece, int len) {
+static void spm_add_user_piece(st_spm *spm, const char *piece, int len) {
     if (!spm || !piece || len <= 0) return;
     if (spm->num_user_pieces >= spm->cap_user_pieces) {
         int new_cap = spm->cap_user_pieces ? spm->cap_user_pieces * 2 : 32;
@@ -258,7 +258,7 @@ static void spm_add_user_piece(ptts_spm *spm, const char *piece, int len) {
     spm->num_user_pieces++;
 }
 
-static void spm_setup_charsmap(ptts_spm *spm) {
+static void spm_setup_charsmap(st_spm *spm) {
     spm->xcda_array = NULL;
     spm->xcda_array_size = 0;
     spm->prefix_replacements = NULL;
@@ -317,22 +317,22 @@ static int utf8_decode_len(const char *s, size_t avail, size_t *out_len) {
     return -1;
 }
 
-static uint32_t xcda_get_base(const ptts_spm *spm, uint32_t index) {
+static uint32_t xcda_get_base(const st_spm *spm, uint32_t index) {
     uint32_t node = spm->xcda_array[index];
     return (node >> 10) << ((node & (1U << 9)) >> 6);
 }
 
-static uint32_t xcda_get_lcheck(const ptts_spm *spm, uint32_t index) {
+static uint32_t xcda_get_lcheck(const st_spm *spm, uint32_t index) {
     uint32_t node = spm->xcda_array[index];
     return node & ((1U << 31) | 0xff);
 }
 
-static int xcda_get_leaf(const ptts_spm *spm, uint32_t index) {
+static int xcda_get_leaf(const st_spm *spm, uint32_t index) {
     uint32_t node = spm->xcda_array[index];
     return (node >> 8) & 1U;
 }
 
-static uint32_t xcda_get_value(const ptts_spm *spm, uint32_t index) {
+static uint32_t xcda_get_value(const st_spm *spm, uint32_t index) {
     uint32_t node = spm->xcda_array[index];
     return node & ((1U << 31) - 1);
 }
@@ -343,7 +343,7 @@ struct norm_result {
     size_t consumed_input;
 };
 
-static size_t spm_user_defined_match(const ptts_spm *spm, const char *input, size_t input_len, size_t input_offset) {
+static size_t spm_user_defined_match(const st_spm *spm, const char *input, size_t input_len, size_t input_offset) {
     size_t best = 0;
     for (int i = 0; i < spm->num_user_pieces; i++) {
         int plen = spm->user_pieces_len[i];
@@ -355,7 +355,7 @@ static size_t spm_user_defined_match(const ptts_spm *spm, const char *input, siz
     return best;
 }
 
-static struct norm_result spm_normalize_prefix(const ptts_spm *spm, const char *input, size_t input_len, size_t input_offset) {
+static struct norm_result spm_normalize_prefix(const st_spm *spm, const char *input, size_t input_len, size_t input_offset) {
     if (input_offset >= input_len) {
         return (struct norm_result){ input + input_offset, 0, 0 };
     }
@@ -421,7 +421,7 @@ static int spm_append(char **out, size_t *out_len, size_t *cap, const char *s, s
     return 0;
 }
 
-static char *spm_normalize(const ptts_spm *spm, const char *text) {
+static char *spm_normalize(const st_spm *spm, const char *text) {
     if (!text) return NULL;
     size_t in_len = strlen(text);
     if (in_len == 0) {
@@ -495,7 +495,7 @@ static char *spm_normalize(const ptts_spm *spm, const char *text) {
  * Public API
  * ======================================================================== */
 
-ptts_spm *ptts_spm_load(const char *path) {
+st_spm *st_spm_load(const char *path) {
     if (!path) return NULL;
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -521,7 +521,7 @@ ptts_spm *ptts_spm_load(const char *path) {
     }
     fclose(f);
 
-    ptts_spm *spm = (ptts_spm *)calloc(1, sizeof(ptts_spm));
+    st_spm *spm = (st_spm *)calloc(1, sizeof(st_spm));
     if (!spm) {
         free(buf);
         return NULL;
@@ -545,14 +545,14 @@ ptts_spm *ptts_spm_load(const char *path) {
 
             if (spm->num_pieces >= spm->cap_pieces) {
                 int new_cap = spm->cap_pieces ? spm->cap_pieces * 2 : 512;
-                struct ptts_spm_piece *np = (struct ptts_spm_piece *)realloc(
-                    spm->pieces, (size_t)new_cap * sizeof(struct ptts_spm_piece));
+                struct st_spm_piece *np = (struct st_spm_piece *)realloc(
+                    spm->pieces, (size_t)new_cap * sizeof(struct st_spm_piece));
                 if (!np) break;
                 spm->pieces = np;
                 spm->cap_pieces = new_cap;
             }
 
-            struct ptts_spm_piece *piece = &spm->pieces[spm->num_pieces];
+            struct st_spm_piece *piece = &spm->pieces[spm->num_pieces];
             if (parse_sentence_piece(p, (size_t)msg_len, piece) != 0) break;
 
             if (piece->len > spm->max_piece_len) spm->max_piece_len = piece->len;
@@ -584,14 +584,14 @@ ptts_spm *ptts_spm_load(const char *path) {
 
     free(buf);
     if (spm->num_pieces == 0) {
-        ptts_spm_free(spm);
+        st_spm_free(spm);
         return NULL;
     }
     spm_setup_charsmap(spm);
     return spm;
 }
 
-void ptts_spm_free(ptts_spm *spm) {
+void st_spm_free(st_spm *spm) {
     if (!spm) return;
     for (int i = 0; i < spm->num_pieces; i++) {
         free(spm->pieces[i].bytes);
@@ -603,18 +603,18 @@ void ptts_spm_free(ptts_spm *spm) {
     free(spm);
 }
 
-const char *ptts_spm_piece(const ptts_spm *spm, int id, int *out_len) {
+const char *st_spm_piece(const st_spm *spm, int id, int *out_len) {
     if (!spm || id < 0 || id >= spm->num_pieces) return NULL;
     if (out_len) *out_len = spm->pieces[id].len;
     return spm->pieces[id].bytes;
 }
 
-int ptts_spm_vocab_size(const ptts_spm *spm) {
+int st_spm_vocab_size(const st_spm *spm) {
     if (!spm) return 0;
     return spm->num_pieces;
 }
 
-int ptts_spm_encode(const ptts_spm *spm, const char *text, int **out_ids, int *out_len) {
+int st_spm_encode(const st_spm *spm, const char *text, int **out_ids, int *out_len) {
     if (!spm || !text || !out_ids || !out_len) return -1;
 
     char *norm = spm_normalize(spm, text);
@@ -668,7 +668,7 @@ int ptts_spm_encode(const ptts_spm *spm, const char *text, int **out_ids, int *o
         int start = pos[i];
 
         for (int j = 0; j < spm->num_pieces; j++) {
-            struct ptts_spm_piece *piece = &spm->pieces[j];
+            struct st_spm_piece *piece = &spm->pieces[j];
             if (!piece->bytes || piece->len <= 0) continue;
             int end = start + piece->len;
             if (end > norm_len) continue;

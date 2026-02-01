@@ -1,10 +1,10 @@
-#include "ptts_kernels.h"
+#include "st_kernels.h"
 
-#ifdef PTTS_USE_CUDA
-#include "ptts_cuda.h"
+#ifdef ST_USE_CUDA
+#include "st_cuda.h"
 #endif
 
-#ifdef PTTS_USE_BLAS
+#ifdef ST_USE_BLAS
 #include <cblas.h>
 #endif
 
@@ -16,7 +16,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#ifdef PTTS_USE_CUDA
+#ifdef ST_USE_CUDA
 static int g_cuda_linear_inited = 0;
 static int g_cuda_linear_enabled = 1;
 static int g_cuda_conv1d_inited = 0;
@@ -26,7 +26,7 @@ static int g_cuda_convtr_enabled = 1;
 
 static int cuda_linear_enabled(void) {
     if (!g_cuda_linear_inited) {
-        const char *v = getenv("PTTS_CUDA_LINEAR");
+        const char *v = getenv("ST_CUDA_LINEAR");
         g_cuda_linear_enabled = !(v && v[0] && strcmp(v, "0") == 0);
         g_cuda_linear_inited = 1;
     }
@@ -35,7 +35,7 @@ static int cuda_linear_enabled(void) {
 
 static int cuda_conv1d_enabled(void) {
     if (!g_cuda_conv1d_inited) {
-        const char *v = getenv("PTTS_CUDA_CONV1D");
+        const char *v = getenv("ST_CUDA_CONV1D");
         g_cuda_conv1d_enabled = !(v && v[0] && strcmp(v, "0") == 0);
         g_cuda_conv1d_inited = 1;
     }
@@ -44,7 +44,7 @@ static int cuda_conv1d_enabled(void) {
 
 static int cuda_convtr_enabled(void) {
     if (!g_cuda_convtr_inited) {
-        const char *v = getenv("PTTS_CUDA_CONVTR");
+        const char *v = getenv("ST_CUDA_CONVTR");
         g_cuda_convtr_enabled = !(v && v[0] && strcmp(v, "0") == 0);
         g_cuda_convtr_inited = 1;
     }
@@ -52,14 +52,14 @@ static int cuda_convtr_enabled(void) {
 }
 #endif
 
-void ptts_linear_forward(float *y, const float *x, const float *w, const float *b,
+void st_linear_forward(float *y, const float *x, const float *w, const float *b,
                          int n, int in, int out) {
-#ifdef PTTS_USE_CUDA
-    if (cuda_linear_enabled() && ptts_cuda_linear_forward(y, x, w, b, n, in, out) == 0) {
+#ifdef ST_USE_CUDA
+    if (cuda_linear_enabled() && st_cuda_linear_forward(y, x, w, b, n, in, out) == 0) {
         return;
     }
 #endif
-#ifdef PTTS_USE_BLAS
+#ifdef ST_USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 n, out, in, 1.0f, x, in, w, in, 0.0f, y, out);
     if (b) {
@@ -89,11 +89,11 @@ void ptts_linear_forward(float *y, const float *x, const float *w, const float *
 #endif
 }
 
-void ptts_conv1d_forward(float *y, const float *x, const float *w, const float *b,
+void st_conv1d_forward(float *y, const float *x, const float *w, const float *b,
                          int in_ch, int out_ch, int T, int k, int stride, int groups) {
-#ifdef PTTS_USE_CUDA
+#ifdef ST_USE_CUDA
     if (cuda_conv1d_enabled() &&
-        ptts_cuda_conv1d_forward(y, x, w, b, in_ch, out_ch, T, k, stride, groups) == 0) {
+        st_cuda_conv1d_forward(y, x, w, b, in_ch, out_ch, T, k, stride, groups) == 0) {
         return;
     }
 #endif
@@ -125,11 +125,11 @@ void ptts_conv1d_forward(float *y, const float *x, const float *w, const float *
     }
 }
 
-void ptts_convtr1d_forward(float *y, const float *x, const float *w, const float *b,
+void st_convtr1d_forward(float *y, const float *x, const float *w, const float *b,
                            int in_ch, int out_ch, int T, int k, int stride, int groups) {
-#ifdef PTTS_USE_CUDA
+#ifdef ST_USE_CUDA
     if (cuda_convtr_enabled() &&
-        ptts_cuda_convtr1d_forward(y, x, w, b, in_ch, out_ch, T, k, stride, groups) == 0) {
+        st_cuda_convtr1d_forward(y, x, w, b, in_ch, out_ch, T, k, stride, groups) == 0) {
         return;
     }
 #endif
@@ -168,13 +168,13 @@ void ptts_convtr1d_forward(float *y, const float *x, const float *w, const float
     }
 }
 
-void ptts_elu_inplace(float *x, int n) {
+void st_elu_inplace(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float v = x[i];
         x[i] = v >= 0.0f ? v : (expf(v) - 1.0f);
     }
 }
 
-void ptts_add_inplace(float *a, const float *b, int n) {
+void st_add_inplace(float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) a[i] += b[i];
 }
