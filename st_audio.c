@@ -1,4 +1,4 @@
-#include "ptts_audio.h"
+#include "st_audio.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,10 +20,10 @@ static void write_u32_le(FILE *f, uint32_t v) {
     fwrite(b, 1, 4, f);
 }
 
-ptts_audio *ptts_audio_create(int sample_rate, int channels, int num_samples) {
+st_audio *st_audio_create(int sample_rate, int channels, int num_samples) {
     if (sample_rate <= 0 || channels <= 0 || num_samples < 0) return NULL;
 
-    ptts_audio *audio = (ptts_audio *)calloc(1, sizeof(ptts_audio));
+    st_audio *audio = (st_audio *)calloc(1, sizeof(st_audio));
     if (!audio) return NULL;
 
     size_t total = (size_t)num_samples * (size_t)channels;
@@ -39,13 +39,13 @@ ptts_audio *ptts_audio_create(int sample_rate, int channels, int num_samples) {
     return audio;
 }
 
-void ptts_audio_free(ptts_audio *audio) {
+void st_audio_free(st_audio *audio) {
     if (!audio) return;
     free(audio->samples);
     free(audio);
 }
 
-int ptts_audio_save_wav(const ptts_audio *audio, const char *path) {
+int st_audio_save_wav(const st_audio *audio, const char *path) {
     if (!audio || !audio->samples || !path) return -1;
 
     FILE *f = fopen(path, "wb");

@@ -1,4 +1,4 @@
-#include "ptts_cuda.h"
+#include "st_cuda.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "ptts_kernels.h"
+#include "st_kernels.h"
 
 #define FLOWLM_FLOW_DIM 512
 #define FLOWLM_LATENT_DIM 32
@@ -34,7 +34,7 @@ static int g_cuda_convtr_inited = 0;
 static int g_cuda_convtr_enabled = 1;
 static int g_cuda_conv1d_inited = 0;
 static int g_cuda_conv1d_enabled = 1;
-#ifdef PTTS_CUDA_VALIDATE
+#ifdef ST_CUDA_VALIDATE
 static int g_cuda_validate_inited = 0;
 static int g_cuda_validate_enabled = 0;
 #endif
@@ -43,7 +43,7 @@ static int g_flow_profile_enabled = 0;
 
 static int cuda_debug_enabled(void) {
     if (!g_cuda_debug_inited) {
-        const char *v = getenv("PTTS_CUDA_DEBUG");
+        const char *v = getenv("ST_CUDA_DEBUG");
         g_cuda_debug = (v && v[0] && strcmp(v, "0") != 0);
         g_cuda_debug_inited = 1;
     }
@@ -52,7 +52,7 @@ static int cuda_debug_enabled(void) {
 
 static int cuda_convtr_enabled(void) {
     if (!g_cuda_convtr_inited) {
-        const char *v = getenv("PTTS_CUDA_CONVTR");
+        const char *v = getenv("ST_CUDA_CONVTR");
         g_cuda_convtr_enabled = !(v && v[0] && strcmp(v, "0") == 0);
         g_cuda_convtr_inited = 1;
     }
@@ -61,17 +61,17 @@ static int cuda_convtr_enabled(void) {
 
 static int cuda_conv1d_enabled(void) {
     if (!g_cuda_conv1d_inited) {
-        const char *v = getenv("PTTS_CUDA_CONV1D");
+        const char *v = getenv("ST_CUDA_CONV1D");
         g_cuda_conv1d_enabled = !(v && v[0] && strcmp(v, "0") == 0);
         g_cuda_conv1d_inited = 1;
     }
     return g_cuda_conv1d_enabled;
 }
 
-#ifdef PTTS_CUDA_VALIDATE
+#ifdef ST_CUDA_VALIDATE
 static int cuda_validate_enabled(void) {
     if (!g_cuda_validate_inited) {
-        const char *v = getenv("PTTS_CUDA_VALIDATE");
+        const char *v = getenv("ST_CUDA_VALIDATE");
         g_cuda_validate_enabled = (v && v[0] && strcmp(v, "0") != 0);
         g_cuda_validate_inited = 1;
     }
@@ -85,7 +85,7 @@ static int cuda_validate_enabled(void) {
 
 static int flow_profile_enabled(void) {
     if (!g_flow_profile_inited) {
-        const char *v = getenv("PTTS_FLOWNET_PROFILE");
+        const char *v = getenv("ST_FLOWNET_PROFILE");
         g_flow_profile_enabled = (v && v[0] && strcmp(v, "0") != 0);
         g_flow_profile_inited = 1;
     }
@@ -111,9 +111,9 @@ typedef struct {
     const float *host;
     float *device;
     size_t bytes;
-} ptts_weight_cache_entry;
+} st_weight_cache_entry;
 
-static ptts_weight_cache_entry *g_cache = NULL;
+static st_weight_cache_entry *g_cache = NULL;
 static int g_cache_len = 0;
 static int g_cache_cap = 0;
 static cublasHandle_t g_handle;
@@ -488,7 +488,7 @@ static int ensure_kernels(void) {
         "}\n";
 
     nvrtcProgram prog;
-    nvrtcResult rc = nvrtcCreateProgram(&prog, src, "ptts_kernels.cu", 0, NULL, NULL);
+    nvrtcResult rc = nvrtcCreateProgram(&prog, src, "st_kernels.cu", 0, NULL, NULL);
     if (rc != NVRTC_SUCCESS) return -1;
     const char *opts[] = {arch};
     rc = nvrtcCompileProgram(prog, 1, opts);
@@ -610,7 +610,7 @@ static int ensure_init(void) {
         return -1;
     }
     g_inited = 1;
-    atexit(ptts_cuda_shutdown);
+    atexit(st_cuda_shutdown);
     return 0;
 }
 
@@ -627,7 +627,7 @@ static float *get_weight_device(const float *host, size_t bytes) {
     }
     if (g_cache_len == g_cache_cap) {
         int next_cap = g_cache_cap ? g_cache_cap * 2 : 32;
-        ptts_weight_cache_entry *next = (ptts_weight_cache_entry *)realloc(
+        st_weight_cache_entry *next = (st_weight_cache_entry *)realloc(
             g_cache, (size_t)next_cap * sizeof(*g_cache));
         if (!next) {
             cudaFree(dev);
@@ -643,7 +643,7 @@ static float *get_weight_device(const float *host, size_t bytes) {
     return dev;
 }
 
-int ptts_cuda_linear_forward(float *y, const float *x, const float *w, const float *b,
+int st_cuda_linear_forward(float *y, const float *x, const float *w, const float *b,
                              int n, int in, int out) {
     if (ensure_init() != 0) return -1;
 
@@ -694,7 +694,7 @@ int ptts_cuda_linear_forward(float *y, const float *x, const float *w, const flo
     return 0;
 }
 
-int ptts_cuda_conv1d_forward(float *y, const float *x, const float *w, const float *b,
+int st_cuda_conv1d_forward(float *y, const float *x, const float *w, const float *b,
                              int in_ch, int out_ch, int T, int k, int stride, int groups) {
     if (ensure_kernels() != 0) return -1;
     int out_len = T / stride;
@@ -734,7 +734,7 @@ int ptts_cuda_conv1d_forward(float *y, const float *x, const float *w, const flo
     return 0;
 }
 
-int ptts_cuda_convtr1d_forward(float *y, const float *x, const float *w, const float *b,
+int st_cuda_convtr1d_forward(float *y, const float *x, const float *w, const float *b,
                                int in_ch, int out_ch, int T, int k, int stride, int groups) {
     if (ensure_kernels() != 0) return -1;
     int out_len = T * stride;
@@ -974,7 +974,7 @@ static int convtr1d_host_fallback(float *d_y, const float *d_x,
         cuda_log_error("cudaMemcpy(convtr host x)", cudaGetLastError());
         free(h_x); free(h_y); return -1;
     }
-    ptts_convtr1d_forward(h_y, h_x, w, b, in_ch, out_ch, T, k, stride, groups);
+    st_convtr1d_forward(h_y, h_x, w, b, in_ch, out_ch, T, k, stride, groups);
     if (cudaMemcpy(d_y, h_y, y_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         cuda_log_error("cudaMemcpy(convtr host y)", cudaGetLastError());
         free(h_x); free(h_y); return -1;
@@ -997,7 +997,7 @@ static int conv1d_host_fallback(float *d_y, const float *d_x,
         cuda_log_error("cudaMemcpy(conv1d host x)", cudaGetLastError());
         free(h_x); free(h_y); return -1;
     }
-    ptts_conv1d_forward(h_y, h_x, w, b, in_ch, out_ch, T, k, stride, groups);
+    st_conv1d_forward(h_y, h_x, w, b, in_ch, out_ch, T, k, stride, groups);
     if (cudaMemcpy(d_y, h_y, y_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         cuda_log_error("cudaMemcpy(conv1d host y)", cudaGetLastError());
         free(h_x); free(h_y); return -1;
@@ -1109,17 +1109,17 @@ static void compare_gpu_cpu(const char *label, const float *d_buf, const float *
     fprintf(stderr, "[ptts] CUDA validate %-10s maxdiff=%.6f\n", label, maxd);
 }
 
-int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
-                             const ptts_cuda_convtr1d_desc *up0,
-                             const ptts_cuda_conv1d_desc *res0_1,
-                             const ptts_cuda_conv1d_desc *res0_2,
-                             const ptts_cuda_convtr1d_desc *up1,
-                             const ptts_cuda_conv1d_desc *res1_1,
-                             const ptts_cuda_conv1d_desc *res1_2,
-                             const ptts_cuda_convtr1d_desc *up2,
-                             const ptts_cuda_conv1d_desc *res2_1,
-                             const ptts_cuda_conv1d_desc *res2_2,
-                             const ptts_cuda_conv1d_desc *dec_out,
+int st_cuda_mimi_convstack(const st_cuda_conv1d_desc *dec_in,
+                             const st_cuda_convtr1d_desc *up0,
+                             const st_cuda_conv1d_desc *res0_1,
+                             const st_cuda_conv1d_desc *res0_2,
+                             const st_cuda_convtr1d_desc *up1,
+                             const st_cuda_conv1d_desc *res1_1,
+                             const st_cuda_conv1d_desc *res1_2,
+                             const st_cuda_convtr1d_desc *up2,
+                             const st_cuda_conv1d_desc *res2_1,
+                             const st_cuda_conv1d_desc *res2_2,
+                             const st_cuda_conv1d_desc *dec_out,
                              const float *x_host, int T,
                              float *out_host, int *out_len) {
     if (!dec_in || !up0 || !res0_1 || !res0_2 || !up1 || !res1_1 || !res1_2 ||
@@ -1547,7 +1547,7 @@ int ptts_cuda_mimi_convstack(const ptts_cuda_conv1d_desc *dec_in,
     return 0;
 }
 
-int ptts_cuda_flownet_forward(const ptts_cuda_flow_net_desc *desc,
+int st_cuda_flownet_forward(const st_cuda_flow_net_desc *desc,
                               const float *cond, const float *ts, const float *tt,
                               const float *x_in, float *out) {
     if (!desc || !cond || !ts || !tt || !x_in || !out) return -1;
@@ -1680,7 +1680,7 @@ int ptts_cuda_flownet_forward(const ptts_cuda_flow_net_desc *desc,
     return 0;
 }
 
-int ptts_cuda_attention_forward(const float *q, const float *k, const float *v,
+int st_cuda_attention_forward(const float *q, const float *k, const float *v,
                                 int T, int H, int D, float *out) {
     if (!q || !k || !v || !out || T <= 0 || H <= 0 || D <= 0) return -1;
     if (ensure_kernels() != 0) return -1;
@@ -1716,7 +1716,7 @@ int ptts_cuda_attention_forward(const float *q, const float *k, const float *v,
     return 0;
 }
 
-int ptts_cuda_attention_step(const float *q, const float *k, const float *v,
+int st_cuda_attention_step(const float *q, const float *k, const float *v,
                              int T, int H, int D, float *out) {
     if (!q || !k || !v || !out || T <= 0 || H <= 0 || D <= 0) return -1;
     if (ensure_kernels() != 0) return -1;
@@ -1752,13 +1752,13 @@ int ptts_cuda_attention_step(const float *q, const float *k, const float *v,
     return 0;
 }
 
-int ptts_cuda_kv_init(int max_len) {
+int st_cuda_kv_init(int max_len) {
     if (max_len <= 0) return -1;
     if (ensure_kernels() != 0) return -1;
     return ensure_kv_cache(max_len);
 }
 
-int ptts_cuda_kv_push(int layer, int pos, const float *k, const float *v) {
+int st_cuda_kv_push(int layer, int pos, const float *k, const float *v) {
     if (!k || !v || layer < 0 || layer >= FLOWLM_NUM_LAYERS || pos < 0) return -1;
     if (!g_k_cache_dev[layer] || !g_v_cache_dev[layer]) return -1;
     size_t stride = (size_t)FLOWLM_NUM_HEADS * FLOWLM_HEAD_DIM;
@@ -1771,7 +1771,7 @@ int ptts_cuda_kv_push(int layer, int pos, const float *k, const float *v) {
     return 0;
 }
 
-int ptts_cuda_attention_step_kv(int layer, int T, int H, int D, const float *q, float *out) {
+int st_cuda_attention_step_kv(int layer, int T, int H, int D, const float *q, float *out) {
     if (!q || !out || T <= 0 || H <= 0 || D <= 0) return -1;
     if (layer < 0 || layer >= FLOWLM_NUM_LAYERS) return -1;
     if (!g_k_cache_dev[layer] || !g_v_cache_dev[layer]) return -1;
@@ -1798,7 +1798,7 @@ int ptts_cuda_attention_step_kv(int layer, int T, int H, int D, const float *q, 
     return 0;
 }
 
-void ptts_cuda_shutdown(void) {
+void st_cuda_shutdown(void) {
     if (!g_inited) return;
     for (int i = 0; i < g_cache_len; i++) {
         cudaFree(g_cache[i].device);
